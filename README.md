@@ -1,21 +1,53 @@
-# model-profiles — named model + agent profiles for omp
+# omp-model-profiles
+
+Named model + thinking-level profiles for [Oh My Pi](https://github.com/can1357/oh-my-pi) (`omp`).
 
 Switch a whole model setup in one keystroke: roles (`default`, `smol`, `slow`, `plan`, …),
 custom roles, and per-agent model overrides — bundled into named profiles you can
 apply, snapshot, and edit from a fullscreen dashboard that looks and keys like the
 native `/models` hub.
 
-## Install (project-local)
+## Install
 
 ```sh
-mkdir -p .omp/extensions
-cp model-profiles.ts .omp/extensions/
+omp plugin install github:muhammad-shameel-ks/omp-model-profiles
 ```
 
-omp discovers `<project>/.omp/extensions/*.ts` automatically. Or load explicitly:
+That is a user-scope install (`~/.omp/plugins`), so `/profiles` is available in every
+project. Confirm it registered:
 
 ```sh
-omp -e ./model-profiles.ts
+omp plugin list      # ● omp-model-profiles@0.1.0
+omp plugin doctor    # 4 ok, 0 warnings, 0 errors
+```
+
+Update to the latest commit, or remove it:
+
+```sh
+omp plugin install github:muhammad-shameel-ks/omp-model-profiles --force
+omp plugin uninstall omp-model-profiles
+```
+
+### Working on the plugin
+
+```sh
+git clone https://github.com/muhammad-shameel-ks/omp-model-profiles
+cd omp-model-profiles
+omp plugin link .    # symlinks this checkout into ~/.omp/plugins
+bun install && bun test && bun run typecheck
+```
+
+Edits take effect on the next omp start; `omp plugin install … --force` puts back the
+pinned GitHub copy.
+
+### No plugin manager
+
+omp also discovers extension files directly — `<project>/.omp/extensions/*.ts` (that
+project only) or `~/.omp/agent/extensions/*.ts` (that omp profile, any project):
+
+```sh
+mkdir -p .omp/extensions && cp model-profiles.ts .omp/extensions/
+omp -e /path/to/model-profiles.ts    # or load a single file explicitly
 ```
 
 ## Use
@@ -145,10 +177,13 @@ roles into your first profile. Nothing is seeded for you.
 ## Development
 
 ```sh
-bunx tsc --noEmit --skipLibCheck --target esnext --module esnext \
-  --moduleResolution bundler --allowImportingTsExtensions model-profiles.ts
+bun install
+bun run typecheck
+bun test
 ```
 
-Smoke suite lives outside the repo (fake host harness + real `Settings` instance);
-it covers apply/skip semantics, agent-override masking, thinking-suffix handling,
-YAML round-trips, malformed files, and argument completions.
+`tests/model-profiles.test.ts` runs against a fake host harness (a stub `pi` API plus a
+real `Settings` instance), so the whole dashboard's non-visual logic is covered:
+apply/skip semantics, agent-override masking, thinking-suffix handling (per-model
+efforts, clamping, `auto`, junk-chain collapse), sidebar menu identity and scroll
+windowing, YAML round-trips, malformed files, and argument completions.
