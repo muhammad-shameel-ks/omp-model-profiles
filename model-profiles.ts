@@ -6,8 +6,15 @@
 //
 // Commands:
 //   /profiles          fullscreen dashboard: apply, snapshot, new, rename, delete,
-//                      per-role and per-agent model picking with fuzzy search
+//                      per-role and per-agent model picking with fuzzy search,
+//                      and the active profile kept in step with live settings
 //   /profiles <name>   apply a profile by name (Tab completes profile names)
+//
+// Focus model: one cursor, two panes. The sidebar is a profile picker whose
+// ↑/↓ hand focus to the detail pane; the detail pane is a single focusable list
+// (description, role rows, agent rows, action bar) where ↑/↓ walk it, ←/→ rotate
+// a row's thinking level or walk the action bar, and enter acts on the row under
+// the cursor. esc walks back one level: detail → picker → close.
 //
 // Implementation note: this extension may only import *values* from the
 // `@oh-my-pi/pi-tui` package ROOT. In the compiled omp binary every other
@@ -206,6 +213,28 @@ function liveRoles(settings: Settings): Record<string, string> {
 			const v = settings.getModelRole(role);
 			if (typeof v === "string" && v) out[role] = v;
 		} catch { /* ignore */ }
+	}
+	return out;
+}
+
+/**
+ * Role entries where the live settings and the profile's stored map disagree.
+ *
+ * A role present only in `live` maps to its new selector; a role present only
+ * in `stored` maps to `undefined`, meaning "settings no longer configure this
+ * role — drop it from the profile". The result is therefore exactly the set of
+ * keys to overwrite so the profile mirrors the live settings.
+ */
+export function roleDrift(
+	live: Record<string, string>,
+	stored: Record<string, string> | undefined,
+): Record<string, string | undefined> {
+	const out: Record<string, string | undefined> = {};
+	for (const [role, selector] of Object.entries(live)) {
+		if (stored?.[role] !== selector) out[role] = selector;
+	}
+	for (const role of Object.keys(stored ?? {})) {
+		if (!Object.hasOwn(live, role)) out[role] = undefined;
 	}
 	return out;
 }
@@ -572,8 +601,53 @@ interface PendingScope {
 	index: number;
 	resolve: (scope: ProfileScope | undefined) => void;
 }
+
+/** How often the hub re-reads the live role settings to catch foreign model switches. */
+const LIVE_SYNC_MS = 2000;
 const SIDEBAR_WIDTH = 26;
-const ACTIONS = ["Apply", "Save current as…", "Rename", "Delete"] as const;
+
+export interface HubAction {
+	id: string;
+	label: string;
+	hint: string;
+}
+
+/**
+ * Bottom row of the detail pane. A horizontal bar, so it is walked with ←/→
+ * and run with enter — never with ↑/↓, which stay bound to the row list above.
+ */
+const ACTIONS: readonly HubAction[] = [
+	{ id: "apply", label: "Apply", hint: "write this profile into your role settings" },
+	{ id: "save", label: "Save current as…", hint: "snapshot your live models into a profile" },
+	{ id: "rename", label: "Rename", hint: "rename this profile" },
+	{ id: "delete", label: "Delete", hint: "remove this profile" },
+];
+
+/** A painted action-bar cell, so a click can be resolved to the action under it. */
+export interface ActionSpan {
+	index: number;
+	start: number;
+	width: number;
+}
+
+/** One focusable row of the detail pane. */
+export interface DetailItem {
+	kind: "role" | "agent" | "action";
+	key: string;
+}
+
+/**
+ * The detail pane's focusable rows, in render order: the profile's role
+ * entries, then its agent entries, then the action row. Headings, blanks and
+ * section chrome are deliberately absent — ↑/↓ walks this list only.
+ */
+export function detailItems(roles: readonly string[], agents: readonly string[]): DetailItem[] {
+	const out: DetailItem[] = [];
+	for (const key of roles) out.push({ kind: "role", key });
+	for (const key of agents) out.push({ kind: "agent", key });
+	out.push({ kind: "action", key: ACTIONS[0]!.id });
+	return out;
+}
 
 /**
  * Sidebar row that creates a profile. It lives in the menu as a real item so
@@ -617,7 +691,31 @@ export class ProfilesHub implements Component {
 	#rolesWindowStart = 0;
 	#agentsWindowStart = 0;
 	#pickerWindowStart = 0;
+	/** Row of the detail pane under the ▸ cursor (index into `detailItems()`). */
+	#detailIndex = 0;
+	/** ←/→ position inside the horizontal action row. */
 	#actionIndex = 0;
+	/** Terminal column the body pane starts at, for mouse hit-testing. */
+	#bodyOrigin = SIDEBAR_WIDTH + 4;
+	/** Body width of the last render, for right-aligned header chrome. */
+	#bodyW = 80;
+	/**
+	 * Content-row index of every focusable detail row of the last render, keyed
+	 * `role:<name>` / `agent:<name>` / `action`. Rebuilt per render so a click
+	 * can be resolved to a row without hard-coding the layout offsets.
+	 */
+	#detailRowAt: Record<string, number> = {};
+	/** Column spans of the action-bar cells painted by the last render. */
+	#actionSpans: ActionSpan[] = [];
+	/** View the model picker was launched from, restored when it closes. */
+	#pickerReturnView: HubView = "roles";
+	/**
+	 * Live role + session-model snapshot as of the last moment the hub knew
+	 * about it. Restamped after every deliberate write, so a mismatch means the
+	 * change came from outside the hub (native `/model`, a subagent, a hook).
+	 */
+	#liveStamp = "";
+	#syncTimer: Timer | null = null;
 	#roleRows: RoleRow[] = [];
 	#rolesMenu: MenuSelection<string>;
 	#agentRows: AgentRow[] = [];
@@ -626,7 +724,7 @@ export class ProfilesHub implements Component {
 	#pickerQuery = new Input();
 	#pickerThinking: string | undefined;
 	#pickerTarget: { kind: "role" | "agent"; key: string } | null = null;
-	#currentSelector: string;
+	#currentSelector = "";
 
 	/** True when the whole selector names an available model (`glm-4.7:max`), so `:max` is not a thinking level. */
 	#isLiteralSelector(selector: string): boolean {
@@ -704,11 +802,74 @@ export class ProfilesHub implements Component {
 		this.#profilesMenu = new MenuSelection(profileMenuItems(this.#profileNames), { getKey: s => s, getSearchText: s => s });
 		this.#rolesMenu = new MenuSelection<string>([], { getKey: s => s, getSearchText: s => s });
 		this.#agentsMenu = new MenuSelection<string>([], { getKey: s => s, getSearchText: s => s });
-		const current = this.#ctx.models.current();
-		this.#currentSelector = current ? `${current.provider}/${current.id}` : "";
 		if (args.initialProfile) this.#profilesMenu.setSelectedKey(args.initialProfile);
 		this.#refreshRoleRows();
 		void this.#refreshAgents();
+		// The live model may have been switched from the native `/model` hub (or
+		// by a subagent) since the last save — fold that into the active profile
+		// before the first paint, then watch for further changes.
+		this.#syncActiveFromLive();
+		this.#restampLive();
+		this.#syncTimer = this.#ctx.setInterval(() => this.#pollLive(), LIVE_SYNC_MS);
+	}
+
+	/** Live role settings plus the session model, as one comparable string. */
+	#stampNow(): string {
+		const current = this.#ctx.models.current();
+		const selector = current ? `${current.provider}/${current.id}` : "";
+		return `${selector}\t${JSON.stringify(liveRoles(this.#scope))}`;
+	}
+
+	/** Record the live state as known-good, so the poller only reports foreign writes. */
+	#restampLive(): void {
+		this.#currentSelector = this.#liveSelector();
+		this.#liveStamp = this.#stampNow();
+	}
+
+	#liveSelector(): string {
+		const current = this.#ctx.models.current();
+		return current ? `${current.provider}/${current.id}` : "";
+	}
+
+	#pollLive(): void {
+		if (this.#disposed) return;
+		if (this.#stampNow() === this.#liveStamp) return;
+		this.#currentSelector = this.#liveSelector();
+		this.#liveStamp = this.#stampNow();
+		this.#syncActiveFromLive();
+		this.#refreshRoleRows();
+		this.#tui.requestRender();
+	}
+
+	/**
+	 * Mirror the live role settings into the active profile's own file, so a
+	 * model switched outside this hub (native `/model`, a subagent, a hook) ends
+	 * up in the profile instead of only in `config.yml`. A no-op when the active
+	 * profile already matches the live settings.
+	 *
+	 * An empty live map is never treated as authoritative: a session with no
+	 * configured roles (a fresh machine, a wiped `config.yml`) would otherwise
+	 * wipe the profile on open. "Nothing is configured" is a gap in the settings,
+	 * not a signal to delete a profile's contents.
+	 */
+	#syncActiveFromLive(): void {
+		const name = this.#profiles.active;
+		if (!name) return;
+		const profile = this.#profiles.profiles[name];
+		if (!profile) return;
+		const live = liveRoles(this.#scope);
+		if (Object.keys(live).length === 0) return;
+		const changes = roleDrift(live, profile.roles);
+		const count = Object.keys(changes).length;
+		if (count === 0) return;
+		profile.roles = { ...live };
+		this.#persist(name);
+		this.#refreshRoleRows();
+		this.#setStatus(
+			`Synced ${count} role${count === 1 ? "" : "s"} from live settings into "${name}" (${profile.scope ?? "project"})`,
+			"info",
+		);
+		this.#ctx.ui.notify(this.#status, "info");
 	}
 
 	get #selectedName(): string | undefined {
@@ -740,27 +901,43 @@ export class ProfilesHub implements Component {
 		this.#tui.requestRender();
 	}
 
+	/** Copy a profile's record, minus its in-memory `scope`, into the right file. */
+	#copyIntoFile(name: string, scope: ProfileScope): void {
+		const record = this.#profiles.profiles[name];
+		if (!record) return;
+		const { scope: _s, ...clean } = record;
+		if (scope === "global") this.#profiles.globalFile.profiles[name] = clean;
+		else this.#profiles.projectFile.profiles[name] = clean;
+	}
+
+	/** Write whichever file owns `scope` back to disk. */
+	#writeFile(scope: ProfileScope): void {
+		if (scope === "global") saveProfiles(this.#ctx.cwd, this.#profiles.globalFile, "global", this.#agentDir);
+		else saveProfiles(this.#ctx.cwd, this.#profiles.projectFile, "project", this.#agentDir);
+	}
+
 	#persist(targetName?: string): void {
 		const name = targetName ?? this.#selectedName;
 		const scope: ProfileScope = (name ? this.#profiles.profiles[name]?.scope : undefined) ?? "project";
 		try {
-			if (scope === "global") {
-				if (name && this.#profiles.profiles[name]) {
-					const { scope: _s, ...clean } = this.#profiles.profiles[name]!;
-					this.#profiles.globalFile.profiles[name] = clean;
-				}
-				saveProfiles(this.#ctx.cwd, this.#profiles.globalFile, "global", this.#agentDir);
-			} else {
-				if (name && this.#profiles.profiles[name]) {
-					const { scope: _s, ...clean } = this.#profiles.profiles[name]!;
-					this.#profiles.projectFile.profiles[name] = clean;
-				}
-				saveProfiles(this.#ctx.cwd, this.#profiles.projectFile, "project", this.#agentDir);
-			}
+			if (name) this.#copyIntoFile(name, scope);
+			this.#writeFile(scope);
 			this.#setStatus(`Saved ${name ? `"${name}" ` : ""}(${scope})`, "info");
 		} catch (err) {
 			this.#setStatus(`Save failed: ${err instanceof Error ? err.message : String(err)}`, "error");
 		}
+	}
+
+	/**
+	 * Register a profile record and write it to the file its scope owns. The
+	 * whole record is copied, not just its roles — snapshotting over an existing
+	 * name, or renaming one, must not drop the agent overrides and description
+	 * that profile already carried.
+	 */
+	#createProfile(key: string, scope: ProfileScope, data: ProfileData): void {
+		this.#profiles.profiles[key] = { ...data, scope };
+		this.#copyIntoFile(key, scope);
+		this.#writeFile(scope);
 	}
 
 	#setStatus(text: string, kind: "info" | "warning" | "error"): void {
@@ -781,14 +958,14 @@ export class ProfilesHub implements Component {
 
 		const res = await applyProfile(this.#pi, this.#ctx, this.#scope, data, targetScope);
 		this.#profiles.active = name;
-		const profileScope = data.scope ?? "project";
-		if (profileScope === "global") {
-			this.#profiles.globalFile.active = name;
-			saveProfiles(this.#ctx.cwd, this.#profiles.globalFile, "global", this.#agentDir);
-		} else {
-			this.#profiles.projectFile.active = name;
-			saveProfiles(this.#ctx.cwd, this.#profiles.projectFile, "project", this.#agentDir);
-		}
+		const profileScope: ProfileScope = data.scope ?? "project";
+		if (profileScope === "global") this.#profiles.globalFile.active = name;
+		else this.#profiles.projectFile.active = name;
+		this.#writeFile(profileScope);
+		// apply is the one hub action that writes live settings; re-baseline here
+		// so the poller does not read our own write back as a foreign model switch
+		// and revert whatever apply skipped.
+		this.#restampLive();
 		this.#refreshRoleRows();
 		void this.#refreshAgents();
 		const summary = formatApplyResult(name, res, targetScope);
@@ -803,6 +980,11 @@ export class ProfilesHub implements Component {
 		const height = Math.max(16, this.#tui.terminal?.rows ?? process.stdout.rows ?? 40);
 		const sidebarW = Math.min(SIDEBAR_WIDTH, Math.max(18, width - 40));
 		const bodyW = Math.max(20, width - sidebarW - 5);
+		// Terminal column the body starts at: `│ ` + sidebar (sidebarW + 1) + `│ `.
+		// Mouse columns arrive in terminal space, so every body-relative hit test
+		// (the action bar) has to subtract this.
+		this.#bodyOrigin = sidebarW + 4;
+		this.#bodyW = bodyW;
 		const contentRows = Math.max(10, height - 4);
 		const side = this.#renderSidebar(sidebarW, contentRows);
 		const body = this.#renderBody(bodyW, contentRows);
@@ -852,29 +1034,45 @@ export class ProfilesHub implements Component {
 		const visible = items.slice(start, start + listRows);
 		for (let i = 0; i < visible.length; i++) {
 			const item = visible[i]!;
-			const hovered = this.#profileHover === item;
+			// Hover is a sidebar-only affordance: once focus is on the detail pane
+			// a pointer highlight would read as a second, competing cursor.
+			const hovered = focused && this.#profileHover === item;
+			const selected = item === selectedItem;
 			if (item === NEW_PROFILE_ITEM) {
-				const selected = item === selectedItem;
 				const cursor = selected && focused ? theme.fg("accent", "▸ ") : "  ";
-				const label = selected && focused ? theme.bg("selectedBg", "＋ New profile") : theme.fg("dim", "＋ New profile");
+				const label = selected && focused
+					? theme.bg("selectedBg", "＋ New profile")
+					: selected
+						? theme.fg("accent", "＋ New profile")
+						: theme.fg("muted", "＋ New profile");
 				out.push(`${cursor}${hovered ? theme.bg("selectedBg", label) : label}`);
 				continue;
 			}
-			const selected = item === selectedItem;
+			// The sidebar always shows which profile is loaded on the right, but
+			// greys the rest out while focus sits on the detail pane — that grey-out
+			// is what makes the ▸ unambiguous about which pane owns the keyboard.
 			const cursor = selected && focused ? theme.fg("accent", "▸ ") : "  ";
-			const dot = item === this.#profiles.active ? theme.fg("success", "● ") : theme.fg("dim", "○ ");
+			const dot = item === this.#profiles.active ? theme.fg("success", "● ") : theme.fg("muted", "○ ");
 			const profScope = this.#profiles.profiles[item]?.scope ?? "project";
-			const scopeTag = theme.fg("dim", profScope === "global" ? " glob" : " proj");
-			const bold = selected ? theme.bold(theme.fg("accent", item)) : item;
+			const scopeTag = theme.fg("muted", profScope === "global" ? " glob" : " proj");
+			// Pad the plain name before painting: String.padEnd counts ANSI escape
+			// bytes as characters, which would over-pad every colored row and
+			// shove its `proj`/`glob` tag out of alignment.
 			const nameWidth = Math.max(4, width - 11);
-			const namePart = truncateToWidth(hovered ? theme.bg("selectedBg", bold) : bold, nameWidth);
-			out.push(`${cursor}${dot}${namePart.padEnd(nameWidth)}${scopeTag}`);
+			const padded = item.padEnd(nameWidth);
+			const painted = selected
+				? theme.bold(theme.fg("accent", padded))
+				: this.#pane === "main"
+					? theme.fg("muted", padded)
+					: padded;
+			const namePart = truncateToWidth(hovered ? theme.bg("selectedBg", painted) : painted, nameWidth);
+			out.push(`${cursor}${dot}${namePart}${scopeTag}`);
 		}
 		if (items.length > visible.length) {
 			const above = start > 0 ? "↑" : " ";
 			const below = start + visible.length < items.length ? "↓" : " ";
 			const range = `${start + 1}-${start + visible.length}/${items.length}`;
-			out.push(theme.fg("dim", `  ${above}${below} ${range}`));
+			out.push(theme.fg("muted", `  ${above}${below} ${range}`));
 		}
 		return out.slice(0, rows);
 	}
@@ -913,65 +1111,149 @@ export class ProfilesHub implements Component {
 		return out.slice(0, rows);
 	}
 
+	/**
+	 * Header line: which profile is loaded, which view, and — right-aligned — the
+	 * model the session is actually running. The live chip anchors every profile
+	 * view to reality instead of only showing what the profile would install.
+	 */
 	#statusRow(): string {
 		const theme = this.#theme;
 		const name = this.#selectedName;
 		const scope = name ? this.#profiles.profiles[name]?.scope : undefined;
-		const scopeBadge = scope ? theme.fg("dim", `[${scope}]`) : "";
+		const scopeBadge = scope ? theme.fg("muted", `[${scope}]`) : "";
 		const head = name
 			? `${theme.fg("accent", name)}${this.#profiles.active === name ? theme.fg("success", " ●") : ""}${scopeBadge ? ` ${scopeBadge}` : ""}`
-			: theme.fg("dim", this.#profilesMenu.selectedItem === NEW_PROFILE_ITEM ? "new profile" : "no profiles");
+			: theme.fg("muted", this.#profilesMenu.selectedItem === NEW_PROFILE_ITEM ? "new profile" : "no profiles");
 		const tab = (view: HubView, label: string) =>
-			this.#view === view ? theme.fg("accent", `[${label}]`) : theme.fg("dim", ` ${label} `);
-		return `${head}  ${tab("profiles", "profiles")}${tab("roles", "roles")}${tab("agents", "agents")}`;
+			this.#view === view ? theme.fg("accent", `[${label}]`) : theme.fg("muted", ` ${label} `);
+		const left = `${head}  ${tab("profiles", "profiles")}${tab("roles", "roles")}${tab("agents", "agents")}`;
+
+		const live = this.#currentSelector;
+		if (!live) return left;
+		const chip = thinkingChip(theme, this.#pi.getThinkingLevel(), true);
+		const text = `live ${truncateToWidth(live, Math.max(8, Math.floor(this.#bodyW * 0.4)))}`;
+		const right = `${theme.fg("muted", text)} ${chip}`;
+		const gap = this.#bodyW - visibleWidth(left) - visibleWidth(right);
+		if (gap < 2) return truncateToWidth(left, this.#bodyW);
+		return `${left}${" ".repeat(gap)}${right}`;
+	}
+
+	/** Focusable rows of the detail pane, in render order. */
+	#detailItems(): DetailItem[] {
+		const data = this.#selectedData;
+		return detailItems(Object.keys(data?.roles ?? {}), Object.keys(data?.agents ?? {}));
+	}
+
+	/** The row under the ▸ cursor, or the action row when the pane has no rows. */
+	#focusedItem(): DetailItem {
+		const items = this.#detailItems();
+		return items[Math.min(this.#detailIndex, items.length - 1)] ?? { kind: "action", key: ACTIONS[0]!.id };
+	}
+
+	/** True while the detail pane owns the keyboard (no modal is stacked on top). */
+	#detailFocused(): boolean {
+		return this.#pane === "main" && this.#view === "profiles" && this.#pendingInput === null
+			&& this.#pendingScope === null && this.#pendingDelete === null;
+	}
+
+	/** ▸ gutter for a detail row; blank unless that row holds the cursor. */
+	#rowCursor(active: boolean): string {
+		return active ? this.#theme.fg("accent", "▸ ") : "  ";
 	}
 
 	#renderDetail(rows: number): string[] {
 		const theme = this.#theme;
+		// Reset before any early return: the new-profile screen still publishes an
+		// action row, and a stale entry from the previous frame would swallow a
+		// click meant for a role that is no longer on screen.
+		this.#detailRowAt = {};
 		const out: string[] = [this.#statusRow(), ""];
 		const name = this.#selectedName;
 		const data = this.#selectedData;
 		if (!name || !data) {
 			const count = Object.keys(this.#profiles.profiles).length;
+			const focused = this.#detailFocused();
 			out.push(theme.fg("accent", "New profile"));
-			out.push(theme.fg("dim", count === 0 ? "No profiles yet." : `${count} profile${count === 1 ? "" : "s"} saved.`));
+			out.push(theme.fg("muted", count === 0 ? "No profiles yet." : `${count} profile${count === 1 ? "" : "s"} saved.`));
 			out.push("");
 			out.push(`  ${theme.bold(theme.fg("text", "n"))} ${theme.fg("text", "create an empty profile, then assign models")}`);
 			out.push(`  ${theme.bold(theme.fg("text", "s"))} ${theme.fg("text", "snapshot your current models as the starting point")}`);
+			out.push("");
+			// The action bar stays reachable here: apply on an unnamed profile is
+			// exactly the create flow, so the footer hint is never a promise the
+			// screen does not keep.
+			this.#detailRowAt["action"] = out.length;
+			out.push(`${this.#rowCursor(focused && this.#focusedItem().kind === "action")}${this.#renderActions()}`);
 			return out.slice(0, rows);
 		}
-		if (data.description) out.push(theme.fg("text", data.description));
-		out.push(theme.fg("muted", `ROLES (${Object.keys(data.roles ?? {}).length})   tab → edit`));
-		for (const [role, sel] of Object.entries(data.roles ?? {})) {
-			const level = this.#levelOf(sel);
-			const chip = thinkingChip(theme, level, thinkingOptions(this.#modelFor(sel)).includes(level));
-			out.push(`  ${theme.fg("accent", `@${role}`.padEnd(12))} ${truncateToWidth(splitSelector(sel, s => this.#isLiteralSelector(s)).base, 34)} ${chip}`);
-		}
-		if (Object.keys(data.roles ?? {}).length === 0) out.push(theme.fg("dim", "  (empty — tab to roles, enter to assign)"));
+
+		// Every row below is focusable, so the cursor is resolved once and each
+		// row asks whether it is the one holding it.
+		const focused = this.#detailFocused();
+		const cursorItem = this.#focusedItem();
+		const selLine = (label: string, selector: string): string => {
+			const level = this.#levelOf(selector);
+			const chip = thinkingChip(theme, level, thinkingOptions(this.#modelFor(selector)).includes(level));
+			const base = truncateToWidth(
+				splitSelector(selector, s => this.#isLiteralSelector(s)).base,
+				Math.max(12, this.#bodyW - 18),
+			);
+			return `${theme.fg("accent", label.padEnd(12))} ${base} ${chip}`;
+		};
+
+		out.push(theme.fg("muted", "DESCRIPTION   e → edit"));
+		out.push(data.description ? theme.fg("text", truncateToWidth(data.description, this.#bodyW - 2)) : theme.fg("muted", "  (none)"));
 		out.push("");
-		out.push(theme.fg("muted", `AGENTS (${Object.keys(data.agents ?? {}).length})   tab ×2 → edit`));
-		for (const [agent, sel] of Object.entries(data.agents ?? {})) {
-			const level = this.#levelOf(sel);
-			const chip = thinkingChip(theme, level, thinkingOptions(this.#modelFor(sel)).includes(level));
-			out.push(`  ${theme.fg("accent", agent.padEnd(12))} ${truncateToWidth(splitSelector(sel, s => this.#isLiteralSelector(s)).base, 34)} ${chip}`);
+
+		const roles = Object.entries(data.roles ?? {});
+		out.push(theme.fg("muted", `ROLES (${roles.length})`));
+		for (const [role, sel] of roles) {
+			const on = focused && cursorItem.kind === "role" && cursorItem.key === role;
+			this.#detailRowAt[`role:${role}`] = out.length;
+			out.push(`${this.#rowCursor(on)}${selLine(`@${role}`, sel)}`);
 		}
-		if (Object.keys(data.agents ?? {}).length === 0) out.push(theme.fg("dim", "  (none)"));
+		if (roles.length === 0) out.push(theme.fg("muted", "  (empty — tab to roles to assign any known role)"));
 		out.push("");
-		out.push(this.#renderActions());
+
+		const agents = Object.entries(data.agents ?? {});
+		out.push(theme.fg("muted", `AGENTS (${agents.length})`));
+		for (const [agent, sel] of agents) {
+			const on = focused && cursorItem.kind === "agent" && cursorItem.key === agent;
+			this.#detailRowAt[`agent:${agent}`] = out.length;
+			out.push(`${this.#rowCursor(on)}${selLine(agent, sel)}`);
+		}
+		if (agents.length === 0) out.push(theme.fg("muted", "  (none)"));
+		out.push("");
+
+		const onActions = focused && cursorItem.kind === "action";
+		this.#detailRowAt["action"] = out.length;
+		out.push(`${this.#rowCursor(onActions)}${this.#renderActions()}`);
 		if (this.#status) {
 			out.push("");
-			out.push(truncateToWidth(this.#theme.fg(this.#statusKind === "error" ? "error" : "warning", this.#status), 200));
+			out.push(truncateToWidth(theme.fg(this.#statusKind === "error" ? "error" : this.#statusKind === "warning" ? "warning" : "muted", this.#status), this.#bodyW));
 		}
 		return out.slice(0, rows);
 	}
 
+	/**
+	 * The action bar. Cells stay compact (only the selected one gains a bracket
+	 * pair) and each cell's column span is recorded while painting, so a click
+	 * lands on the action actually under the pointer.
+	 */
 	#renderActions(): string {
 		const theme = this.#theme;
-		const focused = this.#pane === "main" && this.#view === "profiles";
-		return ACTIONS.map((a, i) => {
+		const focused = this.#detailFocused() && this.#focusedItem().kind === "action";
+		const spans: ActionSpan[] = [];
+		const painted = ACTIONS.map((a, i) => {
 			const selected = focused && i === this.#actionIndex;
-			return selected ? theme.bg("selectedBg", `[${a}]`) : theme.fg("dim", ` ${a} `);
-		}).join(" ");
+			const cell = selected ? `[${a.label}]` : ` ${a.label} `;
+			// Start past the 2-cell ▸ gutter every focusable row shares.
+			const start = 2 + spans.reduce((n, s) => n + s.width + 1, 0);
+			spans.push({ index: i, start, width: visibleWidth(cell) });
+			return selected ? theme.bg("selectedBg", cell) : theme.fg("muted", cell);
+		});
+		this.#actionSpans = spans;
+		return painted.join(" ");
 	}
 
 	#renderRoles(rows: number): string[] {
@@ -1107,10 +1389,17 @@ export class ProfilesHub implements Component {
 			const yes = this.#deleteIndex === 1 ? theme.bg("selectedBg", "[Yes]") : theme.fg("dim", " Yes ");
 			return truncateToWidth(`Delete "${this.#pendingDelete}"?  ${no} ${yes}    y/n · ←→ · enter`, width);
 		}
-		let hint = "↑↓ profile · ←→ pane · enter apply · r roles · a agents · s snapshot · n new · tab view · esc close";
+		let hint: string;
 		if (this.#view === "models") hint = "←→ thinking · type filter · ↑↓ navigate · enter pick · esc back";
 		else if (this.#view === "roles") hint = "↑↓ role · ←→ thinking · enter pick model · ⌫ clear · tab agents · esc back";
 		else if (this.#view === "agents") hint = "↑↓ agent · ←→ thinking · enter pick model · ⌫ clear · tab profiles · esc back";
+		else if (this.#pane === "side") hint = "↑↓ pick profile (focus follows) · → detail · enter apply · r roles · a agents · e description · s snapshot · n new · esc close";
+		else if (this.#focusedItem().kind === "action") {
+			// On the new-profile screen apply is the create flow, so the hint says
+			// what enter will actually do instead of repeating "apply".
+			const what = this.#selectedName ? ACTIONS[this.#actionIndex]?.hint : "create a profile from your current models";
+			hint = `↑↓ row · ←→ action · enter run${what ? ` — ${what}` : ""} · esc profiles · b apply · e description`;
+		} else hint = "↑↓ row · ←→ thinking · enter pick model · r roles · a agents · e description · s snapshot · esc profiles";
 		return truncateToWidth(theme.fg("dim", hint), width);
 	}
 
@@ -1174,11 +1463,16 @@ export class ProfilesHub implements Component {
 			this.#cycleView();
 			return;
 		}
+		// esc walks back one level: the model picker and the roles/agents tabs pop
+		// to the profile they edit, the detail pane returns the cursor to the
+		// profile picker, and the picker itself closes the hub.
 		if (this.#keys.cancel(data)) {
-			if (this.#view === "profiles") this.#close();
-			else {
+			if (this.#view === "profiles") {
+				if (this.#pane === "main") this.#pane = "side";
+				else this.#close();
+			} else {
 				this.#view = "profiles";
-				this.#pane = "side";
+				this.#pane = "main";
 			}
 			return;
 		}
@@ -1190,15 +1484,11 @@ export class ProfilesHub implements Component {
 			this.#agentsInput(data);
 			return;
 		}
-		if (matchesKey(data, "left")) {
-			this.#pane = "side";
-			return;
-		}
-		if (matchesKey(data, "right")) {
-			this.#pane = "main";
-			return;
-		}
 		if (this.#pane === "side") {
+			if (matchesKey(data, "right")) {
+				this.#pane = "main";
+				return;
+			}
 			this.#sidebarInput(data);
 			return;
 		}
@@ -1216,21 +1506,42 @@ export class ProfilesHub implements Component {
 			void this.#refreshAgents();
 		} else {
 			this.#view = "profiles";
-			this.#pane = "side";
+			this.#pane = "main";
 		}
 	}
 
+	/**
+	 * Move the profile selection and hand the keyboard to the detail pane, so
+	 * browsing profiles previews the one you are on with the cursor already
+	 * where you will keep editing. Press ← or esc to come back and keep browsing.
+	 */
+	#selectProfile(step: number): void {
+		this.#profilesMenu.move(step, true);
+		this.#pane = "main";
+		this.#refreshRoleRows();
+		void this.#refreshAgents();
+	}
+
+	/** Move the ▸ cursor within the detail pane, resetting the action bar to its first entry. */
+	#moveDetail(step: number): void {
+		const count = this.#detailItems().length;
+		if (count === 0) return;
+		this.#detailIndex = (this.#detailIndex + step + count) % count;
+		if (this.#focusedItem().kind !== "action") this.#actionIndex = 0;
+	}
+
+
+	/**
+	 * Profile picker. ↑/↓ (or j/k) move the selection and immediately hand the
+	 * keyboard to the detail pane, so browsing previews the profile you land on.
+	 */
 	#sidebarInput(data: string): void {
-		if (this.#keys.up(data)) {
-			this.#profilesMenu.move(-1, true);
-			this.#refreshRoleRows();
-			void this.#refreshAgents();
+		if (this.#keys.up(data) || data === "k") {
+			this.#selectProfile(-1);
 			return;
 		}
-		if (this.#keys.down(data)) {
-			this.#profilesMenu.move(1, true);
-			this.#refreshRoleRows();
-			void this.#refreshAgents();
+		if (this.#keys.down(data) || data === "j") {
+			this.#selectProfile(1);
 			return;
 		}
 		if (matchesKey(data, "enter") || matchesKey(data, "return")) {
@@ -1238,45 +1549,70 @@ export class ProfilesHub implements Component {
 			else void this.#newProfileFlow();
 			return;
 		}
-		if (matchesKey(data, "s")) { void this.#saveCurrentFlow(); return; }
-		if (matchesKey(data, "n")) { void this.#newProfileFlow(); }
+		if (data === "s") { void this.#saveCurrentFlow(); return; }
+		if (data === "n") { void this.#newProfileFlow(); return; }
+		if (data === "r") { this.#view = "roles"; this.#refreshRoleRows(); return; }
+		if (data === "a") { this.#view = "agents"; void this.#refreshAgents(); return; }
+		if (data === "e") { void this.#editDescriptionFlow(); }
 	}
 
+	/**
+	 * Detail pane. ↑/↓ (or j/k) walk the one focusable list — role rows, agent
+	 * rows, then the action bar. On a role/agent row ←/→ rotates the thinking
+	 * level and enter opens the model picker; on the action bar ←/→ picks the
+	 * action and enter runs it, so a horizontal row is never driven vertically.
+	 */
 	#bodyInput(data: string): void {
-		if (matchesKey(data, "left") || this.#keys.up(data)) {
-			this.#actionIndex = (this.#actionIndex - 1 + ACTIONS.length) % ACTIONS.length;
+		const item = this.#focusedItem();
+		const onActions = item.kind === "action";
+		if (this.#keys.up(data) || data === "k") {
+			this.#moveDetail(-1);
 			return;
 		}
-		if (matchesKey(data, "right") || this.#keys.down(data)) {
-			this.#actionIndex = (this.#actionIndex + 1) % ACTIONS.length;
+		if (this.#keys.down(data) || data === "j") {
+			this.#moveDetail(1);
 			return;
 		}
 		if (matchesKey(data, "enter") || matchesKey(data, "return")) {
-			this.#activateAction(ACTIONS[this.#actionIndex] ?? "Apply");
+			if (onActions) this.#activateAction(ACTIONS[this.#actionIndex]?.id ?? "apply");
+			else if (item.kind !== "action") this.#openModelPicker({ kind: item.kind, key: item.key });
 			return;
 		}
-		if (matchesKey(data, "r")) { this.#view = "roles"; this.#refreshRoleRows(); return; }
-		if (matchesKey(data, "a")) { this.#view = "agents"; void this.#refreshAgents(); return; }
-		if (matchesKey(data, "s")) { void this.#saveCurrentFlow(); return; }
-		if (matchesKey(data, "n")) { void this.#newProfileFlow(); }
+		const step = matchesKey(data, "right") ? 1 : matchesKey(data, "left") ? -1 : 0;
+		if (step !== 0) {
+			if (onActions) this.#actionIndex = (this.#actionIndex + step + ACTIONS.length) % ACTIONS.length;
+			else if (item.kind === "role") this.#cycleRoleThinking(item.key, step);
+			else if (item.kind === "agent") this.#cycleAgentThinking(item.key, step);
+			return;
+		}
+		if (data === "s") { void this.#saveCurrentFlow(); return; }
+		if (data === "n") { void this.#newProfileFlow(); return; }
+		if (data === "e") { void this.#editDescriptionFlow(); return; }
+		if (data === "r") { this.#view = "roles"; this.#refreshRoleRows(); return; }
+		if (data === "a") { this.#view = "agents"; void this.#refreshAgents(); return; }
+		if (data === "b") { void this.#applySelected(); }
 	}
 
 	#activateAction(action: string): void {
-		if (action === "Apply") {
-			if (this.#selectedName) void this.#applySelected();
-			else void this.#newProfileFlow();
-		} else if (action.startsWith("Save")) {
-			void this.#saveCurrentFlow();
-		} else if (action === "Rename") {
-			void this.#renameFlow();
-		} else {
-			void this.#deleteFlow();
+		switch (action) {
+			case "apply":
+				if (this.#selectedName) void this.#applySelected();
+				else void this.#newProfileFlow();
+				return;
+			case "save":
+				void this.#saveCurrentFlow();
+				return;
+			case "rename":
+				void this.#renameFlow();
+				return;
+			default:
+				void this.#deleteFlow();
 		}
 	}
 
 	#rolesInput(data: string): void {
-		if (this.#keys.up(data)) { this.#rolesMenu.move(-1, true); return; }
-		if (this.#keys.down(data)) { this.#rolesMenu.move(1, true); return; }
+		if (this.#keys.up(data) || data === "k") { this.#rolesMenu.move(-1, true); return; }
+		if (this.#keys.down(data) || data === "j") { this.#rolesMenu.move(1, true); return; }
 		if (this.#keys.pageUp(data)) {
 			for (let i = 0; i < 10; i++) this.#rolesMenu.move(-1, false);
 			return;
@@ -1309,8 +1645,8 @@ export class ProfilesHub implements Component {
 	}
 
 	#agentsInput(data: string): void {
-		if (this.#keys.up(data)) { this.#agentsMenu.move(-1, true); return; }
-		if (this.#keys.down(data)) { this.#agentsMenu.move(1, true); return; }
+		if (this.#keys.up(data) || data === "k") { this.#agentsMenu.move(-1, true); return; }
+		if (this.#keys.down(data) || data === "j") { this.#agentsMenu.move(1, true); return; }
 		if (this.#keys.pageUp(data)) {
 			for (let i = 0; i < 10; i++) this.#agentsMenu.move(-1, false);
 			return;
@@ -1370,12 +1706,12 @@ export class ProfilesHub implements Component {
 			);
 			return;
 		}
-		if (this.#keys.up(data)) {
+		if (this.#keys.up(data) || data === "k") {
 			this.#picker?.move(-1, true);
 			this.#clampPickerThinking();
 			return;
 		}
-		if (this.#keys.down(data)) {
+		if (this.#keys.down(data) || data === "j") {
 			this.#picker?.move(1, true);
 			this.#clampPickerThinking();
 			return;
@@ -1478,7 +1814,12 @@ export class ProfilesHub implements Component {
 			if (this.#view === "models") { this.#picker?.move(ev.wheel, false); return; }
 			if (this.#view === "roles") { this.#rolesMenu.move(ev.wheel, false); return; }
 			if (this.#view === "agents") { this.#agentsMenu.move(ev.wheel, false); return; }
+			if (this.#view === "profiles" && this.#pane === "main" && this.#focusedItem().kind !== "action") {
+				this.#moveDetail(ev.wheel);
+				return;
+			}
 			this.#profilesMenu.setSelectedIndex(this.#profilesMenu.selectedIndex + ev.wheel);
+			this.#pane = "main";
 			this.#refreshRoleRows();
 			void this.#refreshAgents();
 			return;
@@ -1507,11 +1848,15 @@ export class ProfilesHub implements Component {
 			if (item === NEW_PROFILE_ITEM) {
 				void this.#newProfileFlow();
 			} else if (item !== undefined) {
-				if (item === this.#selectedName && this.#view === "profiles") void this.#applySelected();
-				else {
-					this.#profilesMenu.setSelectedKey(item);
+				// Clicking the sidebar focuses the picker (the keyboard goes where
+				// you clicked); selecting a profile from the keyboard instead hands
+				// focus to the detail pane. Both end up with one visible ▸.
+				if (item === this.#selectedName && this.#view === "profiles") {
 					this.#pane = "side";
+				} else {
+					this.#profilesMenu.setSelectedKey(item);
 					this.#view = "profiles";
+					this.#pane = "side";
 					this.#refreshRoleRows();
 					void this.#refreshAgents();
 				}
@@ -1525,14 +1870,53 @@ export class ProfilesHub implements Component {
 				if (this.#rolesMenu.selectedItem === role) this.#openModelPicker({ kind: "role", key: role });
 				else this.#rolesMenu.setSelectedKey(role);
 			}
-		} else if (this.#view === "agents") {
+			return;
+		}
+		if (this.#view === "agents") {
 			const idx = ev.row - 3 + this.#agentsWindowStart;
 			const agent = idx >= 0 ? this.#agentRows[idx]?.name : undefined;
 			if (agent) {
 				if (this.#agentsMenu.selectedItem === agent) this.#openModelPicker({ kind: "agent", key: agent });
 				else this.#agentsMenu.setSelectedKey(agent);
 			}
+			return;
 		}
+		this.#clickDetail(ev);
+	}
+
+	/**
+	 * Click on the detail pane. A row click focuses it, and a second click on the
+	 * already-focused row opens the model picker — the same two-step the roles and
+	 * agents tabs use, so the pointer never surprises you with a modal.
+	 */
+	#clickDetail(ev: HubMouse): void {
+		this.#pane = "main";
+		const contentRow = ev.row - 1;
+		if (this.#detailRowAt["action"] === contentRow) {
+			// Spans are recorded in body-relative columns while the mouse reports
+			// terminal columns, so translate before testing containment.
+			const bodyCol = ev.col - this.#bodyOrigin;
+			const hit = this.#actionSpans.find(s => bodyCol >= s.start && bodyCol < s.start + s.width);
+			if (hit) this.#actionIndex = hit.index;
+			this.#detailIndex = this.#detailItems().length - 1;
+			return;
+		}
+		for (const [key, row] of Object.entries(this.#detailRowAt)) {
+			if (row !== contentRow) continue;
+			const [kind, name] = key.split(":") as [DetailItem["kind"], string];
+			if (kind === "action") continue;
+			const already = this.#focusedItem().kind === kind && this.#focusedItem().key === name;
+			this.#focusDetail(kind, name);
+			if (already) this.#openModelPicker({ kind, key: name });
+			return;
+		}
+	}
+
+	/** Put the ▸ cursor on a specific detail row without changing the action bar. */
+	#focusDetail(kind: DetailItem["kind"], key: string): void {
+		const index = this.#detailItems().findIndex(i => i.kind === kind && i.key === key);
+		if (index >= 0) this.#detailIndex = index;
+		if (kind !== "action") this.#actionIndex = 0;
 	}
 
 	/** Clamp the pending thinking level to the highlighted model's supported set. */
@@ -1587,6 +1971,9 @@ export class ProfilesHub implements Component {
 		});
 		this.#pickerQuery.setValue("");
 		this.#pickerTarget = target;
+		// Remember where the picker was opened from: the detail pane and the roles
+		// tab both launch it, and esc/pick must return to the one you came from.
+		this.#pickerReturnView = this.#view;
 		this.#view = "models";
 		this.#pane = "main";
 		const stored = target.kind === "role"
@@ -1634,7 +2021,13 @@ export class ProfilesHub implements Component {
 		this.#picker = null;
 		this.#pickerQuery.setValue("");
 		this.#pickerTarget = null;
-		this.#view = wasAgent ? "agents" : "roles";
+		// Back to whichever pane launched the picker; the agents tab is the only
+		// case where the origin is not simply the roles tab.
+		this.#view = this.#pickerReturnView === "profiles"
+			? "profiles"
+			: wasAgent
+				? "agents"
+				: "roles";
 		this.#pane = "main";
 	}
 
@@ -1694,18 +2087,10 @@ export class ProfilesHub implements Component {
 		const scope = await this.#askScope(`Save profile "${key}" where?`, "project");
 		if (!scope) return;
 
+		// Snapshot the live roles but keep whatever else the name already carried
+		// (agent overrides, description) instead of replacing the record wholesale.
 		const prev = this.#profiles.profiles[key] ?? {};
-		const updated: ProfileData = { ...prev, roles: { ...live }, scope };
-		this.#profiles.profiles[key] = updated;
-
-		if (scope === "global") {
-			this.#profiles.globalFile.profiles[key] = { roles: { ...live } };
-			saveProfiles(this.#ctx.cwd, this.#profiles.globalFile, "global", this.#agentDir);
-		} else {
-			this.#profiles.projectFile.profiles[key] = { roles: { ...live } };
-			saveProfiles(this.#ctx.cwd, this.#profiles.projectFile, "project", this.#agentDir);
-		}
-
+		this.#createProfile(key, scope, { ...prev, roles: { ...live } });
 		this.#syncNames(key);
 		this.#setStatus(`Snapshotted ${Object.keys(live).length} roles as "${key}" (${scope})`, "info");
 	}
@@ -1725,17 +2110,7 @@ export class ProfilesHub implements Component {
 		const scope = await this.#askScope(`Save profile "${key}" where?`, "project");
 		if (!scope) return;
 
-		const created: ProfileData = { roles: { ...liveRoles(this.#scope) }, scope };
-		this.#profiles.profiles[key] = created;
-
-		if (scope === "global") {
-			this.#profiles.globalFile.profiles[key] = { roles: { ...liveRoles(this.#scope) } };
-			saveProfiles(this.#ctx.cwd, this.#profiles.globalFile, "global", this.#agentDir);
-		} else {
-			this.#profiles.projectFile.profiles[key] = { roles: { ...liveRoles(this.#scope) } };
-			saveProfiles(this.#ctx.cwd, this.#profiles.projectFile, "project", this.#agentDir);
-		}
-
+		this.#createProfile(key, scope, { roles: { ...liveRoles(this.#scope) } });
 		this.#syncNames(key);
 		this.#setStatus(`Created profile "${key}" (${scope})`, "info");
 	}
@@ -1756,24 +2131,34 @@ export class ProfilesHub implements Component {
 		const scope: ProfileScope = this.#profiles.profiles[old]?.scope ?? "project";
 		const data = this.#profiles.profiles[old]!;
 		delete this.#profiles.profiles[old];
-		this.#profiles.profiles[key] = { ...data, scope };
-
 		if (scope === "global") {
-			const gData = this.#profiles.globalFile.profiles[old] ?? { ...data };
 			delete this.#profiles.globalFile.profiles[old];
-			this.#profiles.globalFile.profiles[key] = gData;
 			if (this.#profiles.globalFile.active === old) this.#profiles.globalFile.active = key;
-			saveProfiles(this.#ctx.cwd, this.#profiles.globalFile, "global", this.#agentDir);
 		} else {
-			const pData = this.#profiles.projectFile.profiles[old] ?? { ...data };
 			delete this.#profiles.projectFile.profiles[old];
-			this.#profiles.projectFile.profiles[key] = pData;
 			if (this.#profiles.projectFile.active === old) this.#profiles.projectFile.active = key;
-			saveProfiles(this.#ctx.cwd, this.#profiles.projectFile, "project", this.#agentDir);
 		}
+		this.#createProfile(key, scope, data);
 		if (this.#profiles.active === old) this.#profiles.active = key;
 		this.#syncNames(key);
 		this.#setStatus(`Renamed "${old}" → "${key}" (${scope})`, "info");
+	}
+
+	/** Edit the profile's one-line description (`e`). Empty clears it. */
+	async #editDescriptionFlow(): Promise<void> {
+		const name = this.#selectedName;
+		if (!name) {
+			this.#setStatus("No profile selected.", "warning");
+			return;
+		}
+		const input = await this.#askInput(`Description for "${name}"`, this.#selectedData?.description ?? "");
+		if (input === undefined) return;
+		const profile = this.#profiles.profiles[name];
+		if (!profile) return;
+		const text = input.trim();
+		if (text) profile.description = text;
+		else delete profile.description;
+		this.#persist(name);
 	}
 
 	async #deleteFlow(): Promise<void> {
@@ -1796,12 +2181,11 @@ export class ProfilesHub implements Component {
 		if (scope === "global") {
 			delete this.#profiles.globalFile.profiles[name];
 			if (this.#profiles.globalFile.active === name) delete this.#profiles.globalFile.active;
-			saveProfiles(this.#ctx.cwd, this.#profiles.globalFile, "global", this.#agentDir);
 		} else {
 			delete this.#profiles.projectFile.profiles[name];
 			if (this.#profiles.projectFile.active === name) delete this.#profiles.projectFile.active;
-			saveProfiles(this.#ctx.cwd, this.#profiles.projectFile, "project", this.#agentDir);
 		}
+		this.#writeFile(scope);
 		if (this.#profiles.active === name) {
 			this.#profiles.active = this.#profiles.projectFile.active ?? this.#profiles.globalFile.active;
 		}
@@ -1825,6 +2209,10 @@ export class ProfilesHub implements Component {
 
 	dispose(): void {
 		this.#picker = null;
+		if (this.#syncTimer !== null) {
+			this.#ctx.clearTimer(this.#syncTimer);
+			this.#syncTimer = null;
+		}
 	}
 }
 

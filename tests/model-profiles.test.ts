@@ -11,8 +11,11 @@ process.env.OMP_AGENT_DIR = agentDir;
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgModelRoles } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { cfgTaskAgentModelOverrides } from "@oh-my-pi/pi-coding-agent/task/settings";
+import { getKnownRoleIds } from "@oh-my-pi/pi-coding-agent/config/model-roles";
+import type { ExtensionAPI, ExtensionCommandContext, KeybindingsManager } from "@oh-my-pi/pi-coding-agent";
+import type { Theme, TUI } from "@oh-my-pi/pi-tui";
 import mod, { applyProfile, formatApplyResult, loadProfiles, saveProfiles, splitSelector, cycleThinking, withThinking, thinkingOptions, clampThinking,
-  profileMenuItems, profileNameOf, windowStart, NEW_PROFILE_ITEM } from "../model-profiles.ts";
+  profileMenuItems, profileNameOf, windowStart, NEW_PROFILE_ITEM, detailItems, roleDrift, ProfilesHub } from "../model-profiles.ts";
 
 let commands: Record<string, any> = {};
 const notifications: { message: string; type?: string }[] = [];
@@ -334,5 +337,217 @@ describe("auto level and chain collapse", () => {
       thinking: "high",
     });
     expect(withThinking("zai/glm-4.7:max:high", "low", isLiteral)).toBe("zai/glm-4.7:max:low");
+  });
+});
+
+describe("detailItems", () => {
+  test("orders role rows, then agent rows, then the action row", () => {
+    expect(detailItems(["default", "smol"], ["explore"])).toEqual([
+      { kind: "role", key: "default" },
+      { kind: "role", key: "smol" },
+      { kind: "agent", key: "explore" },
+      { kind: "action", key: "apply" },
+    ]);
+  });
+
+  test("a profile with no entries still has one focusable row", () => {
+    expect(detailItems([], [])).toEqual([{ kind: "action", key: "apply" }]);
+  });
+
+  test("role and agent rows sharing a name stay distinct", () => {
+    const items = detailItems(["plan"], ["plan"]);
+    expect(items.filter(i => i.key === "plan").map(i => i.kind)).toEqual(["role", "agent"]);
+  });
+});
+
+describe("roleDrift", () => {
+  test("reports only the roles where live and stored disagree", () => {
+    expect(roleDrift({ default: "p/a", smol: "p/b" }, { default: "p/a", slow: "p/c" })).toEqual({
+      smol: "p/b",
+      slow: undefined,
+    });
+  });
+
+  test("identical maps have no drift", () => {
+    expect(roleDrift({ default: "p/a" }, { default: "p/a" })).toEqual({});
+    expect(roleDrift({}, {})).toEqual({});
+  });
+
+  test("a role only in the profile is reported for removal, not silently kept", () => {
+    expect(roleDrift({}, { smol: "p/b" })).toEqual({ smol: undefined });
+  });
+
+  test("a missing stored map is a full overwrite", () => {
+    expect(roleDrift({ default: "p/a" }, undefined)).toEqual({ default: "p/a" });
+  });
+
+  test("applying the drift makes the profile mirror the live settings", () => {
+    const live = { default: "p/a:high", plan: "p/c" };
+    const stored: Record<string, string> = { default: "p/a:low", smol: "p/b" };
+    for (const [role, value] of Object.entries(roleDrift(live, stored))) {
+      if (value === undefined) delete stored[role];
+      else stored[role] = value;
+    }
+    expect(stored).toEqual(live);
+    expect(roleDrift(stored, live)).toEqual({});
+  });
+});
+
+describe("hub: live settings sync into the active profile", () => {
+  // `Settings` keeps role state in process memory, so a fresh init still sees
+  // whatever an earlier case configured. Clear every known role explicitly or
+  // the live map leaks across cases and the sync assertions lie.
+  beforeEach(async () => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.mkdirSync(tmp, { recursive: true });
+    fs.rmSync(agentDir, { recursive: true, force: true });
+    fs.mkdirSync(agentDir, { recursive: true });
+    scope = await Settings.init({ agentDir, cwd: tmp });
+    for (const role of getKnownRoleIds(scope)) scope.setModelRole(role, undefined);
+    cfgTaskAgentModelOverrides.override(scope, {});
+    notifications.length = 0;
+  });
+
+  /**
+   * A hub over the real `Settings`, with the live-sync timer stubbed so the
+   * open-time sync (the one that matters here) runs and the poll never fires.
+   * Each collaborator is stubbed to the handful of members the hub touches;
+   * `as unknown as T` is deliberate — these are test doubles standing in for
+   * host objects whose full contracts are irrelevant to this behaviour.
+   */
+  function makeHub(settings: Settings = scope): ProfilesHub {
+    return new ProfilesHub({
+      done: () => {},
+      tui: { terminal: { rows: 30, columns: 100 }, requestRender: () => {} } as unknown as TUI,
+      theme: {
+        fg: (_c: string, t: string) => t,
+        bg: (_c: string, t: string) => t,
+        bold: (t: string) => t,
+        thinking: {},
+        getThinkingBorderColor: () => (t: string) => t,
+      } as unknown as Theme,
+      ctx: {
+        ...makeCtx(),
+        hasUI: true,
+        mode: "tui",
+        setInterval: () => null,
+        clearTimer: () => {},
+      } as unknown as ExtensionCommandContext,
+      pi: {
+        setModel: async () => true,
+        setThinkingLevel: () => {},
+        getThinkingLevel: () => undefined,
+      } as unknown as ExtensionAPI,
+      scope: settings,
+      keys: { matches: () => false } as unknown as KeybindingsManager,
+      profiles: loadProfiles(tmp, agentDir),
+      agentDir,
+    });
+  }
+
+  const projectFile = () => loadProfiles(tmp, agentDir).projectFile;
+  const globalFile = () => loadProfiles(tmp, agentDir).globalFile;
+
+  /**
+   * The live role map as the hub reads it. `Settings` holds role state in
+   * process memory shared across instances, so the only honest expectation is
+   * the live map itself — pinning a literal role list would leak between cases.
+   */
+  const liveRolesNow = (): Record<string, string> => {
+    const out: Record<string, string> = {};
+    for (const role of getKnownRoleIds(scope)) {
+      const value = scope.getModelRole(role);
+      if (value) out[role] = value;
+    }
+    return out;
+  };
+
+  const seed = (name: string, data: Record<string, unknown>) =>
+    saveProfiles(tmp, { version: 1, active: name, profiles: { [name]: { ...data, scope: "project" } } }, "project");
+
+  test("the synced profile mirrors every live role", () => {
+    seed("live", { roles: { default: "prov-a/model-x" } });
+    scope.setModelRole("default", "prov-b/model-z:xhigh");
+    scope.setModelRole("smol", "prov-b/model-z:low");
+    const expected = liveRolesNow();
+    expect(expected["default"]).toBe("prov-b/model-z:xhigh");
+    const hub = makeHub();
+    expect(projectFile().profiles["live"]?.roles).toEqual(expected);
+    hub.dispose();
+  });
+
+  test("a profile role the live settings never report is dropped", () => {
+    // `legacy` is not a known role, so `liveRoles` never reports it — the same
+    // shape as a role you removed from settings.
+    seed("live", { roles: { default: "prov-a/model-x", legacy: "prov-b/model-y" } });
+    scope.setModelRole("default", "prov-b/model-z");
+    const hub = makeHub();
+    expect(projectFile().profiles["live"]?.roles).not.toHaveProperty("legacy");
+    expect(projectFile().profiles["live"]?.roles).toEqual(liveRolesNow());
+    hub.dispose();
+  });
+
+  test("no other profile is touched", () => {
+    saveProfiles(tmp, {
+      version: 1, active: "live",
+      profiles: {
+        live: { roles: { default: "prov-a/model-x" }, scope: "project" },
+        other: { roles: { default: "prov-b/model-y" }, scope: "project" },
+      },
+    }, "project");
+    scope.setModelRole("default", "prov-b/model-z");
+    const hub = makeHub();
+    expect(projectFile().profiles["other"]?.roles).toEqual({ default: "prov-b/model-y" });
+    hub.dispose();
+  });
+
+  test("a global active profile syncs to the global file, not the project one", () => {
+    saveProfiles(tmp, { version: 1, active: "g", profiles: { g: { roles: { default: "prov-a/model-x" } } } }, "global");
+    saveProfiles(tmp, { version: 1, profiles: {} }, "project");
+    scope.setModelRole("default", "prov-b/model-z");
+    const expected = liveRolesNow();
+    const hub = makeHub();
+    expect(globalFile().profiles["g"]?.roles).toEqual(expected);
+    expect(projectFile().profiles).toEqual({});
+    hub.dispose();
+  });
+
+  test("agent overrides and description survive the sync", () => {
+    seed("live", { description: "keep me", agents: { explore: "prov-b/model-y" } });
+    scope.setModelRole("default", "prov-b/model-z");
+    const hub = makeHub();
+    expect(projectFile().profiles["live"]).toMatchObject({
+      description: "keep me",
+      agents: { explore: "prov-b/model-y" },
+    });
+    hub.dispose();
+  });
+
+  test("a profile that already matches live settings is not rewritten", () => {
+    scope.setModelRole("default", "prov-b/model-z");
+    seed("live", { roles: liveRolesNow() });
+    const hub = makeHub();
+    expect(notifications.some(n => n.message.includes("Synced"))).toBe(false);
+    hub.dispose();
+  });
+
+  test("a session with no configured roles does not wipe the active profile", () => {
+    seed("live", { roles: { default: "prov-a/model-x" }, agents: { explore: "prov-b/model-y" } });
+    // `Settings` keeps role state process-wide, so the empty-live precondition is
+    // expressed directly: a scope that reports no role as configured.
+    const noRoles = new Proxy(scope, {
+      get: (target, prop, receiver) =>
+        prop === "getModelRole" ? () => undefined : Reflect.get(target, prop, receiver),
+    });
+    const hub = makeHub(noRoles as Settings);
+    expect(projectFile().profiles["live"]?.roles).toEqual({ default: "prov-a/model-x" });
+    expect(projectFile().profiles["live"]?.agents).toEqual({ explore: "prov-b/model-y" });
+    hub.dispose();
+  });
+
+  test("roleDrift would report every role for removal given an empty live map", () => {
+    // Pins why the hub guards before calling it: an empty live map must never be
+    // treated as "every role was removed".
+    expect(Object.keys(roleDrift({}, { default: "p/a" }))).toEqual(["default"]);
   });
 });

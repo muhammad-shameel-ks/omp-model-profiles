@@ -54,20 +54,44 @@ omp -e /path/to/model-profiles.ts    # or load a single file explicitly
 
 | Command | What it does |
 | --- | --- |
-| `/profiles` | Fullscreen dashboard: apply, snapshot, new, rename, delete; edit roles and agent overrides; pick models with fuzzy search |
+| `/profiles` | Fullscreen dashboard: apply, snapshot, new, rename, delete; edit roles and agent overrides in place; pick models with fuzzy search; keeps the active profile in step with live settings |
 | `/profiles <name> [project\|global]` | Quick switch: apply that profile immediately (optional target scope; Tab completes profile names and scopes) |
 
 Dashboard keys — the same shape as `/models`:
 
 ```
-↑↓        move in the focused pane        tab      profiles → roles → agents
-← →       switch pane (profiles) ·        enter    apply (sidebar) · pick model (row) · run action
-          cycle thinking level (roles,             
-          agents, picker)                 ⌫        clear a role or agent assignment from the profile
-r / a     jump to roles / agents          n        new profile
-s         snapshot current models as…     esc      back one level, then close
-                                          mouse    hover, click, wheel (fullscreen alt-screen)
+↑↓ / j k   move in the focused pane        tab      profiles → roles → agents
+← →        cycle thinking on a row ·       enter    pick model (row) · run action (bar)
+           walk the action bar             b        apply the profile
+r / a      jump to roles / agents          n        new profile
+s          snapshot current models as…     e        edit the description
+esc        back one level, then close      mouse    hover, click, wheel (fullscreen alt-screen)
 ```
+
+### Focus, and why there is only ever one ▸
+
+The hub has two panes and exactly one cursor. A `▸` marks whatever owns the
+keyboard right now:
+
+- **Profile picker** — `↑`/`↓` (or `j`/`k`) move through the saved profiles and
+  hand focus to the detail pane as they go, so browsing previews the profile you
+  land on with the cursor already where you will keep editing. The sidebar greys
+  out every profile except the one loaded on the right while the detail pane has
+  focus. `esc` (or clicking the sidebar) sends the cursor back to the picker to
+  keep browsing; `esc` there closes the hub.
+- **Detail pane** — the profile is one focusable list: the description, then the
+  role rows, then the agent rows, then the action bar. `↑`/`↓` walk all of it. On
+  a role or agent row `←`/`→` rotate the thinking level and `enter` opens the
+  model picker — you can change a model without ever leaving this screen. On the
+  action bar `←`/`→` pick the action and `enter` runs it, because a horizontal
+  bar should never be driven with vertical arrows.
+
+`enter` in the profile picker still applies the selected profile outright, and
+`b` applies it from anywhere in the detail pane.
+
+The header is right-aligned with the model the session is *actually* running, so
+every profile view is anchored to reality rather than only showing what the
+profile would install.
 
 ### Sidebar navigation
 
@@ -115,6 +139,25 @@ ROLE        PROFILE (model · thinking) → LIVE
 Roles and agents views show `PROFILE → LIVE` side by side, with `≠` marking a row
 where the profile and the live setting disagree — that is your "what would change"
 preview before applying.
+
+## Changes you make outside the hub are captured
+
+The active profile is kept in step with the live role settings, so a model you
+switch with the native `/model` hub (or a subagent, or a hook) ends up in the
+profile instead of only in `config.yml`:
+
+- On open, the hub compares the live roles against the active profile and writes
+  the differences straight to whichever file that profile lives in —
+  `.omp/model-profiles.yml` for a `proj` profile,
+  `~/.omp/agent/model-profiles.yml` for a `glob` one. It reports what it synced.
+- While the hub is open it re-checks every couple of seconds, so a switch made
+  elsewhere lands in the profile mid-session.
+- Only the **active** profile is written. The others are left alone.
+- The live settings win per role: a role the settings no longer configure is
+  dropped from the profile, and a role the settings added is added to it. Agent
+  overrides and the description are never touched by a sync.
+- Applying a profile re-baselines the check, so the hub never reads its own write
+  back as a foreign switch and reverts an entry that apply skipped.
 
 ## Where things live
 
@@ -201,4 +244,6 @@ bun test
 real `Settings` instance), so the whole dashboard's non-visual logic is covered:
 apply/skip semantics, agent-override masking, thinking-suffix handling (per-model
 efforts, clamping, `auto`, junk-chain collapse), sidebar menu identity and scroll
-windowing, YAML round-trips, malformed files, and argument completions.
+windowing, the detail pane's focusable row list, the live-settings drift diff, the
+hub's sync-on-open (including scope routing and that agents/description survive),
+YAML round-trips, malformed files, and argument completions.
