@@ -55,7 +55,7 @@ omp -e /path/to/model-profiles.ts    # or load a single file explicitly
 | Command | What it does |
 | --- | --- |
 | `/profiles` | Fullscreen dashboard: apply, snapshot, new, rename, delete; edit roles and agent overrides; pick models with fuzzy search |
-| `/profiles <name>` | Quick switch: apply that profile immediately (Tab completes profile names) |
+| `/profiles <name> [project\|global]` | Quick switch: apply that profile immediately (optional target scope; Tab completes profile names and scopes) |
 
 Dashboard keys — the same shape as `/models`:
 
@@ -118,12 +118,26 @@ preview before applying.
 
 ## Where things live
 
-| Thing | Path |
+| Thing | Location |
 | --- | --- |
-| Profiles | `<project>/.omp/model-profiles.yml` (scope: project, v1) |
-| Role assignments | written through omp settings: global `~/.omp/agent/config.yml`, or project `.omp/config.yml` when `modelRoleStorage: project` |
-| Agent overrides | `task.agentModelOverrides` (same layer rules as the `/agents` hub) |
+| Project profiles | `<project>/.omp/model-profiles.yml` (versionable with the repo, `proj` tag in sidebar) |
+| Global profiles | `~/.omp/agent/model-profiles.yml` (fallback `~/.omp/model-profiles.yml`, available everywhere, `glob` tag) |
+| Project roles | `<project>/.omp/config.yml` (`scope.setProjectModelRole`) |
+| Global roles | `~/.omp/agent/config.yml` (`scope.setModelRole`) |
+| Agent overrides | `task.agentModelOverrides` (persisted to settings) |
 
+Profiles can be saved **project-only** (scoped to one repository) or **globally** (available across all projects on your machine). Whenever you save a snapshot (`s`), create a new profile (`n`), or apply a profile, the dashboard prompts you:
+
+```
+  Save profile "deepseek" where?
+
+  ▸ [Project only]  .omp/ (current repository only)
+    [Global]        ~/.omp/agent/ (available everywhere)
+
+  ←→ / ↑↓ select · p project · g global · enter confirm · esc cancel
+```
+
+Both global and project profiles load simultaneously into the dashboard. When a project profile shares a name with a global profile, the project profile takes precedence in that repository.
 ```yaml
 version: 1
 active: cheap-fast
@@ -147,13 +161,14 @@ roles into your first profile. Nothing is seeded for you.
 
 ## What "apply" does
 
-1. Validates every entry through `ctx.models.resolve()` — the same matcher `--model` uses.
+1. Prompts whether to save the applied roles to **Project only** (`.omp/config.yml`) or **Global** (`~/.omp/agent/config.yml`), pre-selecting the profile's own scope (or run `/profiles <name> project` / `/profiles <name> global` to choose directly from the command line).
+2. Validates every entry through `ctx.models.resolve()` — the same matcher `--model` uses.
    Unresolvable entries are **skipped, not fatal**, and reported in the notification.
-2. Persists roles (`setModelRole` / `setProjectModelRole` per your `modelRoleStorage`)
+3. Persists roles (`setModelRole` or `setProjectModelRole` per your selected scope)
    and agent overrides, preserving other agents' session-only picks.
-3. Live-switches the session to the profile's `default` model via `pi.setModel()` —
+4. Live-switches the session to the profile's `default` model via `pi.setModel()` —
    no restart, no relaunch.
-4. Records `active:` in the profiles file.
+5. Records `active:` in the profile's source file (`.omp/model-profiles.yml` or `~/.omp/agent/model-profiles.yml`).
 
 `:thinking` suffixes survive editing: picking a model for a role that already had
 `:high` keeps the level.

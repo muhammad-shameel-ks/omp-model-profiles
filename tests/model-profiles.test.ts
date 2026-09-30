@@ -6,6 +6,7 @@ import * as path from "node:path";
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mp-"));
 const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "mp-agent-"));
 process.chdir(tmp);
+process.env.OMP_AGENT_DIR = agentDir;
 
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgModelRoles } from "@oh-my-pi/pi-coding-agent/config/model-settings";
@@ -60,6 +61,7 @@ describe("profiles extension", () => {
   beforeEach(async () => {
     notifications.length = 0; selectAnswer = undefined; switched = [];
     fs.rmSync(path.join(tmp, ".omp"), { recursive: true, force: true });
+    fs.rmSync(path.join(agentDir, "model-profiles.yml"), { force: true });
     scope = await Settings.init({ agentDir, cwd: tmp });
     fakePi.pi = { settings: scope };
   });
@@ -147,7 +149,7 @@ describe("profiles extension", () => {
     fs.writeFileSync(path.join(tmp, ".omp", "model-profiles.yml"),
       "version: 1\nprofiles:\n  ok:\n    roles:\n      smol: a/b\n  bad: 42\nactive: ok\n");
     const loaded = loadProfiles(tmp);
-    expect(loaded.profiles["ok"]).toEqual({ roles: { smol: "a/b" } });
+    expect(loaded.profiles["ok"]).toEqual({ roles: { smol: "a/b" }, scope: "project" });
     expect(loaded.active).toBe("ok");
   });
 
@@ -223,6 +225,44 @@ describe("profiles extension", () => {
     });
     expect(s).toContain('Profile "w" applied (2 roles, 1 agent, live → a/b)');
     expect(s).toContain("@slow (no match)");
+  });
+  test("saveProfiles writes to global or project scope based on parameter", () => {
+    saveProfiles(tmp, { version: 1, profiles: { gprof: { roles: { smol: "prov-a/model-x" } } } }, "global", agentDir);
+    expect(fs.existsSync(path.join(agentDir, "model-profiles.yml"))).toBe(true);
+
+    saveProfiles(tmp, { version: 1, profiles: { pprof: { roles: { smol: "prov-b/model-y" } } } }, "project", agentDir);
+    expect(fs.existsSync(path.join(tmp, ".omp", "model-profiles.yml"))).toBe(true);
+
+    const merged = loadProfiles(tmp, agentDir);
+    expect(merged.profiles["gprof"]).toEqual({ roles: { smol: "prov-a/model-x" }, scope: "global" });
+    expect(merged.profiles["pprof"]).toEqual({ roles: { smol: "prov-b/model-y" }, scope: "project" });
+  });
+
+  test("project profile overrides global profile with same name", () => {
+    saveProfiles(tmp, { version: 1, profiles: { shared: { roles: { default: "prov-a/model-x" } } } }, "global", agentDir);
+    saveProfiles(tmp, { version: 1, profiles: { shared: { roles: { default: "prov-b/model-y" } } } }, "project", agentDir);
+
+    const merged = loadProfiles(tmp, agentDir);
+    expect(merged.profiles["shared"]).toEqual({ roles: { default: "prov-b/model-y" }, scope: "project" });
+  });
+
+  test("applyProfile respects targetScope: project vs global", async () => {
+    await applyProfile(fakePi, makeCtx(), scope, { roles: { smol: "prov-a/model-x" } }, "project");
+    expect(scope.getProjectModelRole("smol")).toBe("prov-a/model-x");
+
+    await applyProfile(fakePi, makeCtx(), scope, { roles: { slow: "prov-b/model-z" } }, "global");
+    expect(cfgModelRoles.get(scope)["slow"]).toBe("prov-b/model-z");
+  });
+
+  test("/profiles <name> project|global applies to specified target scope", async () => {
+    saveProfiles(tmp, { version: 1, profiles: { testp: { roles: { smol: "prov-a/model-x" } } } });
+    await commands["profiles"].handler("testp project", makeCtx());
+    expect(scope.getProjectModelRole("smol")).toBe("prov-a/model-x");
+    expect(notifications[0]?.message).toContain("[project]");
+
+    await commands["profiles"].handler("testp global", makeCtx());
+    expect(cfgModelRoles.get(scope)["smol"]).toBe("prov-a/model-x");
+    expect(notifications[1]?.message).toContain("[global]");
   });
 });
 

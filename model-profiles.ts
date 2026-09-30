@@ -53,16 +53,24 @@ const THINKING_SUFFIXES: Record<string, true> = {
 	xhigh: true,
 };
 
-interface ProfileData {
+export type ProfileScope = "global" | "project";
+
+export interface ProfileData {
 	description?: string;
 	roles?: Record<string, string>;
 	agents?: Record<string, string>;
+	scope?: ProfileScope;
 }
 
-interface ProfilesFile {
+export interface ProfilesFile {
 	version: number;
 	active?: string;
 	profiles: Record<string, ProfileData>;
+}
+
+export interface MergedProfilesFile extends ProfilesFile {
+	globalFile: ProfilesFile;
+	projectFile: ProfilesFile;
 }
 
 // ─── storage ───────────────────────────────────────────────────────────────
@@ -72,15 +80,36 @@ function isStrRecord(v: unknown): v is Record<string, string> {
 	return Object.values(v).every(x => typeof x === "string");
 }
 
-function profilesFile(cwd: string): string {
+export function resolveAgentDir(customAgentDir?: string): string {
+	if (customAgentDir) return customAgentDir;
+	const env = process.env["OMP_AGENT_DIR"] ?? process.env["PI_AGENT_DIR"];
+	if (env) return env;
+	return path.join(os.homedir(), ".omp", "agent");
+}
+
+export function globalProfilesFile(agentDir?: string): string {
+	const dir = resolveAgentDir(agentDir);
+	const agentPath = path.join(dir, FILE_NAME);
+	if (!fs.existsSync(agentPath)) {
+		const rootPath = path.join(path.dirname(dir), FILE_NAME);
+		if (fs.existsSync(rootPath)) return rootPath;
+	}
+	return agentPath;
+}
+
+export function projectProfilesFile(cwd: string): string {
 	return path.join(cwd, ".omp", FILE_NAME);
 }
 
-export function loadProfiles(cwd: string): ProfilesFile {
+export function profilesFile(cwd: string, scope: ProfileScope = "project", agentDir?: string): string {
+	return scope === "global" ? globalProfilesFile(agentDir) : projectProfilesFile(cwd);
+}
+
+export function parseProfilesFile(filePath: string): ProfilesFile {
 	const empty: ProfilesFile = { version: FILE_VERSION, profiles: {} };
 	let raw: string;
 	try {
-		raw = fs.readFileSync(profilesFile(cwd), "utf-8");
+		raw = fs.readFileSync(filePath, "utf-8");
 	} catch {
 		return empty;
 	}
@@ -92,29 +121,63 @@ export function loadProfiles(cwd: string): ProfilesFile {
 	}
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return empty;
 	const profiles: Record<string, ProfileData> = {};
-	const rawProfiles: unknown = (parsed as { profiles?: unknown }).profiles;
-	if (rawProfiles && typeof rawProfiles === "object" && !Array.isArray(rawProfiles)) {
-		for (const [name, p] of Object.entries(rawProfiles as Record<string, unknown>)) {
+	if ("profiles" in parsed && parsed.profiles && typeof parsed.profiles === "object" && !Array.isArray(parsed.profiles)) {
+		for (const [name, p] of Object.entries(parsed.profiles as Record<string, unknown>)) {
 			if (!p || typeof p !== "object" || Array.isArray(p)) continue;
-			const rec = p as Record<string, unknown>;
 			const clean: ProfileData = {};
-			if (typeof rec["description"] === "string") clean.description = rec["description"];
-			if (isStrRecord(rec["roles"])) clean.roles = { ...rec["roles"] };
-			if (isStrRecord(rec["agents"])) clean.agents = { ...rec["agents"] };
+			if ("description" in p && typeof p.description === "string") clean.description = p.description;
+			if ("roles" in p && isStrRecord(p.roles)) clean.roles = { ...p.roles };
+			if ("agents" in p && isStrRecord(p.agents)) clean.agents = { ...p.agents };
 			profiles[name] = clean;
 		}
 	}
 	const out: ProfilesFile = { version: FILE_VERSION, profiles };
-	const active: unknown = (parsed as { active?: unknown }).active;
-	if (typeof active === "string" && profiles[active]) out.active = active;
+	if ("active" in parsed && typeof parsed.active === "string" && profiles[parsed.active]) {
+		out.active = parsed.active;
+	}
 	return out;
 }
 
-export function saveProfiles(cwd: string, data: ProfilesFile): void {
-	const dir = path.join(cwd, ".omp");
+export function loadProfiles(cwd: string, agentDir?: string): MergedProfilesFile {
+	const gPath = globalProfilesFile(agentDir);
+	const pPath = projectProfilesFile(cwd);
+	const globalFile = parseProfilesFile(gPath);
+	const projectFile = parseProfilesFile(pPath);
+
+	const merged: Record<string, ProfileData> = {};
+	for (const [name, prof] of Object.entries(globalFile.profiles)) {
+		merged[name] = { ...prof, scope: "global" };
+	}
+	for (const [name, prof] of Object.entries(projectFile.profiles)) {
+		merged[name] = { ...prof, scope: "project" };
+	}
+
+	const active = projectFile.active ?? globalFile.active;
+
+	return {
+		version: FILE_VERSION,
+		active,
+		profiles: merged,
+		globalFile,
+		projectFile,
+	};
+}
+
+export function saveProfiles(
+	cwd: string,
+	data: ProfilesFile,
+	scope: ProfileScope = "project",
+	agentDir?: string,
+): void {
+	const target = profilesFile(cwd, scope, agentDir);
+	const dir = path.dirname(target);
 	fs.mkdirSync(dir, { recursive: true });
-	const target = profilesFile(cwd);
-	const text = YAML.stringify({ version: FILE_VERSION, active: data.active, profiles: data.profiles }, null, 2);
+	const cleanProfiles: Record<string, ProfileData> = {};
+	for (const [k, v] of Object.entries(data.profiles)) {
+		const { scope: _s, ...rest } = v;
+		cleanProfiles[k] = rest;
+	}
+	const text = YAML.stringify({ version: FILE_VERSION, active: data.active, profiles: cleanProfiles }, null, 2);
 	const body = text.endsWith("\n") ? text : `${text}\n`;
 	const tmp = `${target}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
 	try {
@@ -342,9 +405,10 @@ export async function applyProfile(
 	ctx: ExtensionCommandContext,
 	scope: Settings,
 	profile: ProfileData,
+	targetScope?: ProfileScope,
 ): Promise<ApplyResult> {
 	const res: ApplyResult = { appliedRoles: [], appliedAgents: [], skipped: [] };
-	const storage = cfgModelRoleStorage.get(scope);
+	const storage = targetScope ?? cfgModelRoleStorage.get(scope);
 
 	for (const [role, selector] of Object.entries(profile.roles ?? {})) {
 		if (!ctx.models.resolve(firstPattern(selector))) {
@@ -414,12 +478,13 @@ export async function applyProfile(
 	return res;
 }
 
-export function formatApplyResult(name: string, res: ApplyResult): string {
+export function formatApplyResult(name: string, res: ApplyResult, targetScope?: ProfileScope): string {
 	const counts: string[] = [];
 	if (res.appliedRoles.length > 0) counts.push(`${res.appliedRoles.length} role${res.appliedRoles.length === 1 ? "" : "s"}`);
 	if (res.appliedAgents.length > 0) counts.push(`${res.appliedAgents.length} agent${res.appliedAgents.length === 1 ? "" : "s"}`);
 	if (res.switchedDefault) counts.push(`live → ${res.switchedDefault}${res.switchedThinking ? `:${res.switchedThinking}` : ""}`);
-	let head = `Profile "${name}" applied`;
+	const badge = targetScope ? `[${targetScope}] ` : "";
+	let head = `${badge}Profile "${name}" applied`;
 	if (counts.length > 0) head += ` (${counts.join(", ")})`;
 	if (res.skipped.length === 0) return head;
 	return `${head}. Skipped: ${res.skipped.map(s => `${s.key} (${s.reason})`).join("; ")}`;
@@ -489,13 +554,24 @@ interface RoleRow {
 	profile: string;
 	stale: boolean;
 }
-
 interface PendingInput {
 	title: string;
 	input: Input;
 	resolve: (value: string | undefined) => void;
 }
 
+interface ScopeOption {
+	scope: ProfileScope;
+	label: string;
+	desc: string;
+}
+
+interface PendingScope {
+	title: string;
+	options: ScopeOption[];
+	index: number;
+	resolve: (scope: ProfileScope | undefined) => void;
+}
 const SIDEBAR_WIDTH = 26;
 const ACTIONS = ["Apply", "Save current as…", "Rename", "Delete"] as const;
 
@@ -530,7 +606,8 @@ export class ProfilesHub implements Component {
 	#pi: ExtensionAPI;
 	#scope: Settings;
 	#keys: HubKeys;
-	#profiles: ProfilesFile;
+	#profiles: MergedProfilesFile;
+	#agentDir?: string;
 	#view: HubView = "profiles";
 	#pane: HubPane = "side";
 	#profileNames: string[];
@@ -577,6 +654,7 @@ export class ProfilesHub implements Component {
 		return cycleThinking(effective, step, options);
 	}
 	#pendingInput: PendingInput | null = null;
+	#pendingScope: PendingScope | null = null;
 	#pendingDelete: string | null = null;
 	#deleteIndex = 0;
 	#status = "";
@@ -593,6 +671,7 @@ export class ProfilesHub implements Component {
 		keys: KeybindingsManager;
 		profiles: ProfilesFile;
 		initialProfile?: string;
+		agentDir?: string;
 	}) {
 		this.#done = args.done;
 		this.#tui = args.tui;
@@ -601,8 +680,27 @@ export class ProfilesHub implements Component {
 		this.#pi = args.pi;
 		this.#scope = args.scope;
 		this.#keys = hubKeys(args.keys);
-		this.#profiles = args.profiles;
-		this.#profileNames = Object.keys(args.profiles.profiles).sort();
+		if (args.agentDir) {
+			this.#agentDir = args.agentDir;
+		} else if (args.scope && "getAgentDir" in args.scope && typeof args.scope.getAgentDir === "function") {
+			this.#agentDir = (args.scope as { getAgentDir: () => string }).getAgentDir();
+		}
+		if ("globalFile" in args.profiles && "projectFile" in args.profiles) {
+			this.#profiles = args.profiles as MergedProfilesFile;
+		} else {
+			this.#profiles = {
+				version: args.profiles.version,
+				active: args.profiles.active,
+				profiles: { ...args.profiles.profiles },
+				globalFile: { version: FILE_VERSION, profiles: {} },
+				projectFile: {
+					version: args.profiles.version,
+					active: args.profiles.active,
+					profiles: { ...args.profiles.profiles },
+				},
+			};
+		}
+		this.#profileNames = Object.keys(this.#profiles.profiles).sort();
 		this.#profilesMenu = new MenuSelection(profileMenuItems(this.#profileNames), { getKey: s => s, getSearchText: s => s });
 		this.#rolesMenu = new MenuSelection<string>([], { getKey: s => s, getSearchText: s => s });
 		this.#agentsMenu = new MenuSelection<string>([], { getKey: s => s, getSearchText: s => s });
@@ -642,10 +740,24 @@ export class ProfilesHub implements Component {
 		this.#tui.requestRender();
 	}
 
-	#persist(): void {
+	#persist(targetName?: string): void {
+		const name = targetName ?? this.#selectedName;
+		const scope: ProfileScope = (name ? this.#profiles.profiles[name]?.scope : undefined) ?? "project";
 		try {
-			saveProfiles(this.#ctx.cwd, this.#profiles);
-			this.#setStatus(`Saved ${FILE_NAME}`, "info");
+			if (scope === "global") {
+				if (name && this.#profiles.profiles[name]) {
+					const { scope: _s, ...clean } = this.#profiles.profiles[name]!;
+					this.#profiles.globalFile.profiles[name] = clean;
+				}
+				saveProfiles(this.#ctx.cwd, this.#profiles.globalFile, "global", this.#agentDir);
+			} else {
+				if (name && this.#profiles.profiles[name]) {
+					const { scope: _s, ...clean } = this.#profiles.profiles[name]!;
+					this.#profiles.projectFile.profiles[name] = clean;
+				}
+				saveProfiles(this.#ctx.cwd, this.#profiles.projectFile, "project", this.#agentDir);
+			}
+			this.#setStatus(`Saved ${name ? `"${name}" ` : ""}(${scope})`, "info");
 		} catch (err) {
 			this.#setStatus(`Save failed: ${err instanceof Error ? err.message : String(err)}`, "error");
 		}
@@ -663,12 +775,23 @@ export class ProfilesHub implements Component {
 			this.#setStatus("No profile selected — press n to create one.", "warning");
 			return;
 		}
-		const res = await applyProfile(this.#pi, this.#ctx, this.#scope, data);
+		const defaultScope: ProfileScope = data.scope ?? (cfgModelRoleStorage.get(this.#scope) === "project" ? "project" : "global");
+		const targetScope = await this.#askScope(`Apply "${name}" roles to settings:`, defaultScope);
+		if (!targetScope) return;
+
+		const res = await applyProfile(this.#pi, this.#ctx, this.#scope, data, targetScope);
 		this.#profiles.active = name;
-		this.#persist();
+		const profileScope = data.scope ?? "project";
+		if (profileScope === "global") {
+			this.#profiles.globalFile.active = name;
+			saveProfiles(this.#ctx.cwd, this.#profiles.globalFile, "global", this.#agentDir);
+		} else {
+			this.#profiles.projectFile.active = name;
+			saveProfiles(this.#ctx.cwd, this.#profiles.projectFile, "project", this.#agentDir);
+		}
 		this.#refreshRoleRows();
 		void this.#refreshAgents();
-		const summary = formatApplyResult(name, res);
+		const summary = formatApplyResult(name, res, targetScope);
 		this.#setStatus(summary, res.skipped.length > 0 ? "warning" : "info");
 		this.#ctx.ui.notify(summary, res.skipped.length > 0 ? "warning" : "info");
 	}
@@ -714,7 +837,12 @@ export class ProfilesHub implements Component {
 		const out: string[] = [];
 		const items = this.#profilesMenu.visibleItems;
 		const selectedItem = this.#profilesMenu.selectedItem;
-		const focused = this.#pane === "side" && this.#view === "profiles" && !this.#pendingInput && this.#pendingDelete === null;
+		const focused =
+			this.#pane === "side" &&
+			this.#view === "profiles" &&
+			!this.#pendingInput &&
+			!this.#pendingScope &&
+			this.#pendingDelete === null;
 		// Window the list so the selection stays on screen; also required for the
 		// trailing create row to be reachable once profiles outnumber rows.
 		// Reserve the last row for the scroll counter when the list overflows.
@@ -735,8 +863,12 @@ export class ProfilesHub implements Component {
 			const selected = item === selectedItem;
 			const cursor = selected && focused ? theme.fg("accent", "▸ ") : "  ";
 			const dot = item === this.#profiles.active ? theme.fg("success", "● ") : theme.fg("dim", "○ ");
+			const profScope = this.#profiles.profiles[item]?.scope ?? "project";
+			const scopeTag = theme.fg("dim", profScope === "global" ? " glob" : " proj");
 			const bold = selected ? theme.bold(theme.fg("accent", item)) : item;
-			out.push(`${cursor}${dot}${truncateToWidth(hovered ? theme.bg("selectedBg", bold) : bold, Math.max(6, width - 5))}`);
+			const nameWidth = Math.max(4, width - 11);
+			const namePart = truncateToWidth(hovered ? theme.bg("selectedBg", bold) : bold, nameWidth);
+			out.push(`${cursor}${dot}${namePart.padEnd(nameWidth)}${scopeTag}`);
 		}
 		if (items.length > visible.length) {
 			const above = start > 0 ? "↑" : " ";
@@ -748,6 +880,7 @@ export class ProfilesHub implements Component {
 	}
 
 	#renderBody(width: number, rows: number): string[] {
+		if (this.#pendingScope) return this.#renderScope(rows);
 		if (this.#pendingInput) return this.#renderInput(rows);
 		if (this.#view === "models") return this.#renderPicker(width, rows);
 		if (this.#view === "roles") return this.#renderRoles(rows);
@@ -755,11 +888,38 @@ export class ProfilesHub implements Component {
 		return this.#renderDetail(rows);
 	}
 
+	#renderScope(rows: number): string[] {
+		const theme = this.#theme;
+		const s = this.#pendingScope;
+		if (!s) return [];
+		const out: string[] = [
+			this.#statusRow(),
+			"",
+			`  ${theme.bold(theme.fg("accent", s.title))}`,
+			"",
+		];
+		for (let i = 0; i < s.options.length; i++) {
+			const opt = s.options[i]!;
+			const selected = i === s.index;
+			const cursor = selected ? theme.fg("accent", "▸ ") : "  ";
+			const badge = selected
+				? theme.bg("selectedBg", `[${opt.label}]`)
+				: theme.fg("dim", ` ${opt.label} `);
+			const desc = selected ? theme.fg("text", opt.desc) : theme.fg("dim", opt.desc);
+			out.push(`  ${cursor}${badge}  ${desc}`);
+		}
+		out.push("");
+		out.push(theme.fg("dim", "  ←→ / ↑↓ select · p project · g global · enter confirm · esc cancel"));
+		return out.slice(0, rows);
+	}
+
 	#statusRow(): string {
 		const theme = this.#theme;
 		const name = this.#selectedName;
+		const scope = name ? this.#profiles.profiles[name]?.scope : undefined;
+		const scopeBadge = scope ? theme.fg("dim", `[${scope}]`) : "";
 		const head = name
-			? `${theme.fg("accent", name)}${this.#profiles.active === name ? theme.fg("success", " ●") : ""}`
+			? `${theme.fg("accent", name)}${this.#profiles.active === name ? theme.fg("success", " ●") : ""}${scopeBadge ? ` ${scopeBadge}` : ""}`
 			: theme.fg("dim", this.#profilesMenu.selectedItem === NEW_PROFILE_ITEM ? "new profile" : "no profiles");
 		const tab = (view: HubView, label: string) =>
 			this.#view === view ? theme.fg("accent", `[${label}]`) : theme.fg("dim", ` ${label} `);
@@ -937,6 +1097,11 @@ export class ProfilesHub implements Component {
 
 	#footer(width: number): string {
 		const theme = this.#theme;
+		if (this.#pendingScope !== null) {
+			const p = this.#pendingScope.index === 0 ? theme.bg("selectedBg", "[Project only]") : theme.fg("dim", " Project only ");
+			const g = this.#pendingScope.index === 1 ? theme.bg("selectedBg", "[Global]") : theme.fg("dim", " Global ");
+			return truncateToWidth(`${this.#pendingScope.title}  ${p} ${g}    p/g · ←→ · enter · esc`, width);
+		}
 		if (this.#pendingDelete !== null) {
 			const no = this.#deleteIndex === 0 ? theme.bg("selectedBg", "[No]") : theme.fg("dim", " No ");
 			const yes = this.#deleteIndex === 1 ? theme.bg("selectedBg", "[Yes]") : theme.fg("dim", " Yes ");
@@ -956,6 +1121,41 @@ export class ProfilesHub implements Component {
 		if (data.startsWith("\x1b[<")) {
 			const ev = decodeMouse(data);
 			if (ev) this.#handleMouse(ev);
+			return;
+		}
+		if (this.#pendingScope) {
+			const s = this.#pendingScope;
+			if (
+				this.#keys.up(data) ||
+				this.#keys.down(data) ||
+				matchesKey(data, "left") ||
+				matchesKey(data, "right") ||
+				matchesKey(data, "tab")
+			) {
+				s.index = (s.index + 1) % s.options.length;
+				this.#tui.requestRender();
+				return;
+			}
+			if (data.toLowerCase() === "p") {
+				const idx = s.options.findIndex(o => o.scope === "project");
+				if (idx >= 0) s.index = idx;
+				this.#resolveScope(s.options[s.index]?.scope);
+				return;
+			}
+			if (data.toLowerCase() === "g") {
+				const idx = s.options.findIndex(o => o.scope === "global");
+				if (idx >= 0) s.index = idx;
+				this.#resolveScope(s.options[s.index]?.scope);
+				return;
+			}
+			if (matchesKey(data, "enter") || matchesKey(data, "return")) {
+				this.#resolveScope(s.options[s.index]?.scope);
+				return;
+			}
+			if (matchesKey(data, "escape")) {
+				this.#resolveScope(undefined);
+				return;
+			}
 			return;
 		}
 		if (this.#pendingInput) {
@@ -1252,6 +1452,16 @@ export class ProfilesHub implements Component {
 	}
 
 	#handleMouse(ev: HubMouse): void {
+		if (this.#pendingScope) {
+			if (ev.leftClick && ev.col > SIDEBAR_WIDTH + 2) {
+				if (ev.row === 4) {
+					this.#resolveScope(this.#pendingScope.options[0]?.scope);
+				} else if (ev.row === 5) {
+					this.#resolveScope(this.#pendingScope.options[1]?.scope);
+				}
+			}
+			return;
+		}
 		if (this.#pendingInput) return;
 		if (ev.motion) {
 			if (ev.col < SIDEBAR_WIDTH + 2 && this.#view !== "models") {
@@ -1440,11 +1650,32 @@ export class ProfilesHub implements Component {
 		this.#tui.requestRender();
 		return promise;
 	}
-
 	#resolveInput(value: string | undefined): void {
 		const p = this.#pendingInput;
 		this.#pendingInput = null;
 		p?.resolve(value);
+	}
+
+	#askScope(
+		title: string,
+		preselect: ProfileScope = "project",
+	): Promise<ProfileScope | undefined> {
+		const { promise, resolve } = Promise.withResolvers<ProfileScope | undefined>();
+		const options: ScopeOption[] = [
+			{ scope: "project", label: "Project only", desc: ".omp/ (current repository only)" },
+			{ scope: "global", label: "Global", desc: "~/.omp/agent/ (available everywhere)" },
+		];
+		const index = preselect === "global" ? 1 : 0;
+		this.#pendingScope = { title, options, index, resolve };
+		this.#tui.requestRender();
+		return promise;
+	}
+
+	#resolveScope(value: ProfileScope | undefined): void {
+		const s = this.#pendingScope;
+		this.#pendingScope = null;
+		s?.resolve(value);
+		this.#tui.requestRender();
 	}
 
 	async #saveCurrentFlow(): Promise<void> {
@@ -1456,11 +1687,27 @@ export class ProfilesHub implements Component {
 		const name = await this.#askInput("Snapshot current models as profile", this.#selectedName ?? "");
 		if (!name?.trim()) return;
 		const key = name.trim();
+		if (/[\u0000-\u001f]/.test(key)) {
+			this.#setStatus("Profile names cannot contain control characters.", "warning");
+			return;
+		}
+		const scope = await this.#askScope(`Save profile "${key}" where?`, "project");
+		if (!scope) return;
+
 		const prev = this.#profiles.profiles[key] ?? {};
-		this.#profiles.profiles[key] = { ...prev, roles: { ...live } };
+		const updated: ProfileData = { ...prev, roles: { ...live }, scope };
+		this.#profiles.profiles[key] = updated;
+
+		if (scope === "global") {
+			this.#profiles.globalFile.profiles[key] = { roles: { ...live } };
+			saveProfiles(this.#ctx.cwd, this.#profiles.globalFile, "global", this.#agentDir);
+		} else {
+			this.#profiles.projectFile.profiles[key] = { roles: { ...live } };
+			saveProfiles(this.#ctx.cwd, this.#profiles.projectFile, "project", this.#agentDir);
+		}
+
 		this.#syncNames(key);
-		this.#persist();
-		this.#setStatus(`Snapshotted ${Object.keys(live).length} roles as "${key}"`, "info");
+		this.#setStatus(`Snapshotted ${Object.keys(live).length} roles as "${key}" (${scope})`, "info");
 	}
 
 	async #newProfileFlow(): Promise<void> {
@@ -1475,9 +1722,22 @@ export class ProfilesHub implements Component {
 			this.#setStatus(`Profile "${key}" already exists.`, "warning");
 			return;
 		}
-		this.#profiles.profiles[key] = { roles: { ...liveRoles(this.#scope) } };
+		const scope = await this.#askScope(`Save profile "${key}" where?`, "project");
+		if (!scope) return;
+
+		const created: ProfileData = { roles: { ...liveRoles(this.#scope) }, scope };
+		this.#profiles.profiles[key] = created;
+
+		if (scope === "global") {
+			this.#profiles.globalFile.profiles[key] = { roles: { ...liveRoles(this.#scope) } };
+			saveProfiles(this.#ctx.cwd, this.#profiles.globalFile, "global", this.#agentDir);
+		} else {
+			this.#profiles.projectFile.profiles[key] = { roles: { ...liveRoles(this.#scope) } };
+			saveProfiles(this.#ctx.cwd, this.#profiles.projectFile, "project", this.#agentDir);
+		}
+
 		this.#syncNames(key);
-		this.#persist();
+		this.#setStatus(`Created profile "${key}" (${scope})`, "info");
 	}
 
 	async #renameFlow(): Promise<void> {
@@ -1493,11 +1753,27 @@ export class ProfilesHub implements Component {
 			this.#setStatus(`Profile "${key}" already exists.`, "warning");
 			return;
 		}
-		this.#profiles.profiles[key] = this.#profiles.profiles[old]!;
+		const scope: ProfileScope = this.#profiles.profiles[old]?.scope ?? "project";
+		const data = this.#profiles.profiles[old]!;
 		delete this.#profiles.profiles[old];
+		this.#profiles.profiles[key] = { ...data, scope };
+
+		if (scope === "global") {
+			const gData = this.#profiles.globalFile.profiles[old] ?? { ...data };
+			delete this.#profiles.globalFile.profiles[old];
+			this.#profiles.globalFile.profiles[key] = gData;
+			if (this.#profiles.globalFile.active === old) this.#profiles.globalFile.active = key;
+			saveProfiles(this.#ctx.cwd, this.#profiles.globalFile, "global", this.#agentDir);
+		} else {
+			const pData = this.#profiles.projectFile.profiles[old] ?? { ...data };
+			delete this.#profiles.projectFile.profiles[old];
+			this.#profiles.projectFile.profiles[key] = pData;
+			if (this.#profiles.projectFile.active === old) this.#profiles.projectFile.active = key;
+			saveProfiles(this.#ctx.cwd, this.#profiles.projectFile, "project", this.#agentDir);
+		}
 		if (this.#profiles.active === old) this.#profiles.active = key;
 		this.#syncNames(key);
-		this.#persist();
+		this.#setStatus(`Renamed "${old}" → "${key}" (${scope})`, "info");
 	}
 
 	async #deleteFlow(): Promise<void> {
@@ -1515,11 +1791,22 @@ export class ProfilesHub implements Component {
 		const name = this.#pendingDelete;
 		this.#pendingDelete = null;
 		if (!name) return;
+		const scope: ProfileScope = this.#profiles.profiles[name]?.scope ?? "project";
 		delete this.#profiles.profiles[name];
-		if (this.#profiles.active === name) delete this.#profiles.active;
+		if (scope === "global") {
+			delete this.#profiles.globalFile.profiles[name];
+			if (this.#profiles.globalFile.active === name) delete this.#profiles.globalFile.active;
+			saveProfiles(this.#ctx.cwd, this.#profiles.globalFile, "global", this.#agentDir);
+		} else {
+			delete this.#profiles.projectFile.profiles[name];
+			if (this.#profiles.projectFile.active === name) delete this.#profiles.projectFile.active;
+			saveProfiles(this.#ctx.cwd, this.#profiles.projectFile, "project", this.#agentDir);
+		}
+		if (this.#profiles.active === name) {
+			this.#profiles.active = this.#profiles.projectFile.active ?? this.#profiles.globalFile.active;
+		}
 		this.#syncNames();
-		this.#persist();
-		this.#setStatus(`Deleted "${name}"`, "info");
+		this.#setStatus(`Deleted "${name}" (${scope})`, "info");
 	}
 
 	#syncNames(select?: string): void {
@@ -1556,7 +1843,11 @@ async function openHub(pi: ExtensionAPI, ctx: ExtensionCommandContext, initialPr
 		return;
 	}
 	const scope = pi.pi.settings as Settings;
-	const profiles = loadProfiles(ctx.cwd);
+	const agentDir =
+		scope && "getAgentDir" in scope && typeof scope.getAgentDir === "function"
+			? (scope as { getAgentDir: () => string }).getAgentDir()
+			: undefined;
+	const profiles = loadProfiles(ctx.cwd, agentDir);
 	try {
 		await ctx.ui.custom<{ applied?: string; error?: string } | undefined>(
 			(tui, theme, kb, done) =>
@@ -1570,6 +1861,7 @@ async function openHub(pi: ExtensionAPI, ctx: ExtensionCommandContext, initialPr
 					keys: kb,
 					profiles,
 					initialProfile,
+					agentDir,
 				}),
 			{
 				overlay: true,
@@ -1583,7 +1875,11 @@ async function openHub(pi: ExtensionAPI, ctx: ExtensionCommandContext, initialPr
 
 async function headlessFlow(pi: ExtensionAPI, ctx: ExtensionCommandContext, initialProfile?: string): Promise<void> {
 	const scope = pi.pi.settings as Settings;
-	const profiles = loadProfiles(ctx.cwd);
+	const agentDir =
+		scope && "getAgentDir" in scope && typeof scope.getAgentDir === "function"
+			? (scope as { getAgentDir: () => string }).getAgentDir()
+			: undefined;
+	const profiles = loadProfiles(ctx.cwd, agentDir);
 	const names = Object.keys(profiles.profiles);
 	if (names.length === 0) {
 		ctx.ui.notify(
@@ -1594,7 +1890,13 @@ async function headlessFlow(pi: ExtensionAPI, ctx: ExtensionCommandContext, init
 	}
 	let name = initialProfile;
 	if (!name) {
-		name = await ctx.ui.select("Apply profile", names);
+		name = await ctx.ui.select(
+			"Apply profile",
+			names.map(n => {
+				const p = profiles.profiles[n];
+				return { label: n, description: p?.scope ? `[${p.scope}]` : undefined };
+			}),
+		);
 		if (!name) return;
 	}
 	await applyNamed(pi, ctx, scope, profiles, name);
@@ -1604,8 +1906,9 @@ async function applyNamed(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
 	scope: Settings,
-	profiles: ProfilesFile,
+	profiles: MergedProfilesFile,
 	name: string,
+	targetScope?: ProfileScope,
 ): Promise<void> {
 	const data = profiles.profiles[name];
 	if (!data) {
@@ -1613,23 +1916,42 @@ async function applyNamed(
 		ctx.ui.notify(`Unknown profile "${name}". Known: ${known.join(", ") || "(none)"}`, "error");
 		return;
 	}
-	const res = await applyProfile(pi, ctx, scope, data);
+	const chosenScope = targetScope ?? data.scope ?? (cfgModelRoleStorage.get(scope) === "project" ? "project" : "global");
+	const res = await applyProfile(pi, ctx, scope, data, chosenScope);
 	profiles.active = name;
+	const agentDir =
+		scope && "getAgentDir" in scope && typeof scope.getAgentDir === "function"
+			? (scope as { getAgentDir: () => string }).getAgentDir()
+			: undefined;
 	try {
-		saveProfiles(ctx.cwd, profiles);
+		if (data.scope === "global") {
+			profiles.globalFile.active = name;
+			saveProfiles(ctx.cwd, profiles.globalFile, "global", agentDir);
+		} else {
+			profiles.projectFile.active = name;
+			saveProfiles(ctx.cwd, profiles.projectFile, "project", agentDir);
+		}
 	} catch (err) {
 		ctx.ui.notify(`Profile applied but could not be saved: ${err instanceof Error ? err.message : String(err)}`, "warning");
 	}
-	ctx.ui.notify(formatApplyResult(name, res), res.skipped.length > 0 ? "warning" : "info");
+	ctx.ui.notify(formatApplyResult(name, res, chosenScope), res.skipped.length > 0 ? "warning" : "info");
 }
 
 async function applyByName(pi: ExtensionAPI, ctx: ExtensionCommandContext, args: string): Promise<void> {
 	const scope = pi.pi.settings as Settings;
-	const profiles = loadProfiles(ctx.cwd);
+	const agentDir =
+		scope && "getAgentDir" in scope && typeof scope.getAgentDir === "function"
+			? (scope as { getAgentDir: () => string }).getAgentDir()
+			: undefined;
+	const profiles = loadProfiles(ctx.cwd, agentDir);
 	const names = Object.keys(profiles.profiles);
-	const want = args.trim();
+	const parts = args.trim().split(/\s+/).filter(Boolean);
+	const want = parts[0];
+	const explicitScope = parts[1]?.toLowerCase() as ProfileScope | undefined;
+	const targetScope = explicitScope === "global" || explicitScope === "project" ? explicitScope : undefined;
+
 	if (want) {
-		await applyNamed(pi, ctx, scope, profiles, want);
+		await applyNamed(pi, ctx, scope, profiles, want, targetScope);
 		return;
 	}
 	if (names.length === 0) {
@@ -1639,9 +1961,15 @@ async function applyByName(pi: ExtensionAPI, ctx: ExtensionCommandContext, args:
 		);
 		return;
 	}
-	const picked = await ctx.ui.select("Apply profile", names);
+	const picked = await ctx.ui.select(
+		"Apply profile",
+		names.map(n => {
+			const p = profiles.profiles[n];
+			return { label: n, description: p?.scope ? `[${p.scope}]` : undefined };
+		}),
+	);
 	if (!picked) return;
-	await applyNamed(pi, ctx, scope, profiles, picked);
+	await applyNamed(pi, ctx, scope, profiles, picked, targetScope);
 }
 
 // ─── extension entry ───────────────────────────────────────────────────────
@@ -1652,19 +1980,35 @@ export default function modelProfiles(pi: ExtensionAPI): void {
 	pi.registerCommand("profiles", {
 		description: "Model profiles: no args opens the dashboard; /profiles <name> applies a profile",
 		getArgumentCompletions: prefix => {
-			let profiles: ProfilesFile;
+			let profiles: MergedProfilesFile;
+			const scope = pi.pi.settings as Settings;
+			const agentDir =
+				scope && "getAgentDir" in scope && typeof scope.getAgentDir === "function"
+					? (scope as { getAgentDir: () => string }).getAgentDir()
+					: undefined;
 			try {
-				profiles = loadProfiles(process.cwd());
+				profiles = loadProfiles(process.cwd(), agentDir);
 			} catch {
 				return null;
 			}
+			const trimmed = prefix.trim();
+			if (prefix.includes(" ")) {
+				const parts = prefix.trim().split(/\s+/);
+				const scopePrefix = parts[1] ?? "";
+				const scopes = ["project", "global"].filter(s => s.startsWith(scopePrefix.toLowerCase()));
+				return scopes.length > 0 ? scopes.map(s => ({ value: s, label: s })) : null;
+			}
 			const items = Object.keys(profiles.profiles)
-				.filter(name => name.startsWith(prefix))
-				.map(name => ({
-					value: name,
-					label: name === profiles.active ? `${name} ●` : name,
-					description: profiles.profiles[name]?.description,
-				}));
+				.filter(name => name.startsWith(trimmed))
+				.map(name => {
+					const p = profiles.profiles[name];
+					const scopeBadge = p?.scope ? ` [${p.scope}]` : "";
+					return {
+						value: name,
+						label: name === profiles.active ? `${name} ●${scopeBadge}` : `${name}${scopeBadge}`,
+						description: p?.description,
+					};
+				});
 			return items.length > 0 ? items : null;
 		},
 		handler: async (args, ctx) => {
