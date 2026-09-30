@@ -551,3 +551,138 @@ describe("hub: live settings sync into the active profile", () => {
     expect(Object.keys(roleDrift({}, { default: "p/a" }))).toEqual(["default"]);
   });
 });
+
+describe("hub: profile picker keeps focus while browsing", () => {
+  beforeEach(async () => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.mkdirSync(tmp, { recursive: true });
+    fs.rmSync(agentDir, { recursive: true, force: true });
+    fs.mkdirSync(agentDir, { recursive: true });
+    scope = await Settings.init({ agentDir, cwd: tmp });
+    for (const role of getKnownRoleIds(scope)) scope.setModelRole(role, undefined);
+    notifications.length = 0;
+  });
+
+  function makeHub(): ProfilesHub {
+    return new ProfilesHub({
+      done: () => {},
+      tui: { terminal: { rows: 26, columns: 100 }, requestRender: () => {} } as unknown as TUI,
+      // Identity paint: the stub drops all styling, so `▸` is the only marker of
+      // where the cursor is, which is exactly what these cases assert on.
+      theme: {
+        fg: (_c: string, t: string) => t,
+        bg: (_c: string, t: string) => t,
+        bold: (t: string) => t,
+        thinking: {},
+        getThinkingBorderColor: () => (t: string) => t,
+      } as unknown as Theme,
+      ctx: {
+        ...makeCtx(),
+        hasUI: true,
+        mode: "tui",
+        setInterval: () => null,
+        clearTimer: () => {},
+      } as unknown as ExtensionCommandContext,
+      pi: {
+        setModel: async () => true,
+        setThinkingLevel: () => {},
+        getThinkingLevel: () => undefined,
+      } as unknown as ExtensionAPI,
+      scope,
+      keys: { matches: () => false } as unknown as KeybindingsManager,
+      profiles: loadProfiles(tmp, agentDir),
+      agentDir,
+    });
+  }
+
+  const seedFour = () => saveProfiles(tmp, {
+    version: 1,
+    active: "Alpha",
+    profiles: {
+      Alpha: { roles: { default: "prov-a/model-x:high" }, scope: "project" },
+      Bravo: { roles: { default: "prov-b/model-y" }, scope: "project" },
+      Charlie: { roles: { default: "prov-b/model-z" }, scope: "project" },
+      Delta: { roles: { default: "prov-a/model-x" }, scope: "project" },
+    },
+  }, "project");
+
+  const DOWN = "\x1b[B";
+  const RIGHT = "\x1b[C";
+
+  /** The profile currently loaded on the right, read off the rendered header. */
+  const loaded = (hub: ProfilesHub): string | undefined => {
+    const header = hub.render(100)
+      .map(l => l.replace(/\x1b\[[0-9;]*m/g, ""))
+      .find(l => l.includes("[profiles]"));
+    if (!header) return undefined;
+    // Drop the pane chrome: everything up to the last `│` is sidebar and border.
+    return header.slice(header.lastIndexOf("│") + 1).trim().split(/\s+/)[0];
+  };
+
+  /** Where the cursor is: the pane of the row carrying `▸`. */
+  const cursorPane = (hub: ProfilesHub): "sidebar" | "detail" | "none" => {
+    for (const line of hub.render(100)) {
+      const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
+      const at = plain.indexOf("▸");
+      if (at < 0) continue;
+      const secondBar = plain.indexOf("│", 1);
+      return secondBar > at ? "sidebar" : "detail";
+    }
+    return "none";
+  };
+
+  test("↓ walks past three profiles without the cursor leaving the picker", () => {
+    seedFour();
+    const hub = makeHub();
+    expect([loaded(hub), cursorPane(hub)]).toEqual(["Alpha", "sidebar"]);
+    hub.handleInput(DOWN);
+    expect([loaded(hub), cursorPane(hub)]).toEqual(["Bravo", "sidebar"]);
+    hub.handleInput(DOWN);
+    expect([loaded(hub), cursorPane(hub)]).toEqual(["Charlie", "sidebar"]);
+    hub.handleInput(DOWN);
+    expect([loaded(hub), cursorPane(hub)]).toEqual(["Delta", "sidebar"]);
+    hub.dispose();
+  });
+
+  test("→ is what moves focus right, and ↓ then edits the detail rows", () => {
+    seedFour();
+    const hub = makeHub();
+    hub.handleInput(DOWN);
+    hub.handleInput(RIGHT);
+    expect(cursorPane(hub)).toBe("detail");
+    expect(loaded(hub)).toBe("Bravo");
+    // ↓ in the detail pane must move within it, never back into the picker.
+    hub.handleInput(DOWN);
+    expect(cursorPane(hub)).toBe("detail");
+    expect(loaded(hub)).toBe("Bravo");
+    hub.dispose();
+  });
+
+  test("esc returns the cursor to the picker without changing the profile", () => {
+    seedFour();
+    const hub = makeHub();
+    hub.handleInput(DOWN);
+    hub.handleInput(DOWN);
+    hub.handleInput(RIGHT);
+    hub.handleInput("\x1b");
+    expect([loaded(hub), cursorPane(hub)]).toEqual(["Charlie", "sidebar"]);
+    hub.dispose();
+  });
+
+  test("the wheel follows the pointer and never steals the cursor", () => {
+    seedFour();
+    const hub = makeHub();
+    hub.handleInput(DOWN);
+    hub.handleInput(RIGHT);
+    expect(cursorPane(hub)).toBe("detail");
+    // SGR wheel-down is button 64 | 1. Column 10 is over the sidebar: two notches
+    // down from Bravo lands on Delta, and the cursor stays on the detail pane.
+    hub.handleInput("\x1b[<65;10;5M");
+    hub.handleInput("\x1b[<65;10;6M");
+    expect([loaded(hub), cursorPane(hub)]).toEqual(["Delta", "detail"]);
+    // Column 60 is over the body, so it walks the detail rows instead.
+    hub.handleInput("\x1b[<65;60;7M");
+    expect(loaded(hub)).toBe("Delta");
+    hub.dispose();
+  });
+});

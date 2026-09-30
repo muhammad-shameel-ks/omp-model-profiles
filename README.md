@@ -73,12 +73,13 @@ esc        back one level, then close      mouse    hover, click, wheel (fullscr
 The hub has two panes and exactly one cursor. A `▸` marks whatever owns the
 keyboard right now:
 
-- **Profile picker** — `↑`/`↓` (or `j`/`k`) move through the saved profiles and
-  hand focus to the detail pane as they go, so browsing previews the profile you
-  land on with the cursor already where you will keep editing. The sidebar greys
-  out every profile except the one loaded on the right while the detail pane has
-  focus. `esc` (or clicking the sidebar) sends the cursor back to the picker to
-  keep browsing; `esc` there closes the hub.
+- **Profile picker** — `↑`/`↓` (or `j`/`k`) move through the saved profiles and the
+  detail pane re-renders as a live preview of the one you are on. The cursor stays
+  in the sidebar, so you can walk past the third, fourth, tenth profile without
+  interrupting yourself. `→` is what moves focus right (or click the detail pane);
+  `esc` brings it back. The sidebar greys out every profile except the one loaded
+  on the right while the detail pane has focus, which is what makes the single
+  `▸` unambiguous about which pane owns the keyboard.
 - **Detail pane** — the profile is one focusable list: the description, then the
   role rows, then the agent rows, then the action bar. `↑`/`↓` walk all of it. On
   a role or agent row `←`/`→` rotate the thinking level and `enter` opens the
@@ -86,8 +87,12 @@ keyboard right now:
   action bar `←`/`→` pick the action and `enter` runs it, because a horizontal
   bar should never be driven with vertical arrows.
 
-`enter` in the profile picker still applies the selected profile outright, and
-`b` applies it from anywhere in the detail pane.
+`enter` in the profile picker applies the selected profile outright, and `b`
+applies it from anywhere in the detail pane.
+
+The wheel follows the pointer, like any two-pane browser: over the sidebar it
+browses profiles, over the body it walks the detail rows. Neither path moves the
+cursor between panes.
 
 The header is right-aligned with the model the session is *actually* running, so
 every profile view is anchored to reality rather than only showing what the

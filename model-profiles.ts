@@ -11,10 +11,12 @@
 //   /profiles <name>   apply a profile by name (Tab completes profile names)
 //
 // Focus model: one cursor, two panes. The sidebar is a profile picker whose
-// ↑/↓ hand focus to the detail pane; the detail pane is a single focusable list
-// (description, role rows, agent rows, action bar) where ↑/↓ walk it, ←/→ rotate
-// a row's thinking level or walk the action bar, and enter acts on the row under
-// the cursor. esc walks back one level: detail → picker → close.
+// ↑/↓ browse the list — the detail pane previews as you move, but the cursor
+// stays put so ↓ can walk the whole list; `→` (or a click on the detail pane)
+// moves focus right. The detail pane is a single focusable list (description,
+// role rows, agent rows, action bar) where ↑/↓ walk it, ←/→ rotate a row's
+// thinking level or walk the action bar, and enter acts on the row under the
+// cursor. esc walks back one level: detail → picker → close.
 //
 // Implementation note: this extension may only import *values* from the
 // `@oh-my-pi/pi-tui` package ROOT. In the compiled omp binary every other
@@ -1393,7 +1395,7 @@ export class ProfilesHub implements Component {
 		if (this.#view === "models") hint = "←→ thinking · type filter · ↑↓ navigate · enter pick · esc back";
 		else if (this.#view === "roles") hint = "↑↓ role · ←→ thinking · enter pick model · ⌫ clear · tab agents · esc back";
 		else if (this.#view === "agents") hint = "↑↓ agent · ←→ thinking · enter pick model · ⌫ clear · tab profiles · esc back";
-		else if (this.#pane === "side") hint = "↑↓ pick profile (focus follows) · → detail · enter apply · r roles · a agents · e description · s snapshot · n new · esc close";
+		else if (this.#pane === "side") hint = "↑↓ pick profile (previews on the right) · → edit it · enter apply · r roles · a agents · e description · s snapshot · n new · esc close";
 		else if (this.#focusedItem().kind === "action") {
 			// On the new-profile screen apply is the create flow, so the hint says
 			// what enter will actually do instead of repeating "apply".
@@ -1511,13 +1513,13 @@ export class ProfilesHub implements Component {
 	}
 
 	/**
-	 * Move the profile selection and hand the keyboard to the detail pane, so
-	 * browsing profiles previews the one you are on with the cursor already
-	 * where you will keep editing. Press ← or esc to come back and keep browsing.
+	 * Move the profile selection. Focus deliberately stays in the picker: the
+	 * detail pane re-renders as a live preview, but the keyboard does not follow
+	 * the selection, so `↓` can walk past three, four, ten profiles without
+	 * `→` in between. `→` (or a click on the detail pane) is what moves focus.
 	 */
 	#selectProfile(step: number): void {
 		this.#profilesMenu.move(step, true);
-		this.#pane = "main";
 		this.#refreshRoleRows();
 		void this.#refreshAgents();
 	}
@@ -1814,14 +1816,14 @@ export class ProfilesHub implements Component {
 			if (this.#view === "models") { this.#picker?.move(ev.wheel, false); return; }
 			if (this.#view === "roles") { this.#rolesMenu.move(ev.wheel, false); return; }
 			if (this.#view === "agents") { this.#agentsMenu.move(ev.wheel, false); return; }
-			if (this.#view === "profiles" && this.#pane === "main" && this.#focusedItem().kind !== "action") {
-				this.#moveDetail(ev.wheel);
+			// The wheel follows the pointer, like any two-pane browser: over the
+			// sidebar it browses profiles, over the body it walks the detail rows.
+			// Neither path moves the cursor between panes.
+			if (ev.col < SIDEBAR_WIDTH + 2) {
+				this.#selectProfile(ev.wheel);
 				return;
 			}
-			this.#profilesMenu.setSelectedIndex(this.#profilesMenu.selectedIndex + ev.wheel);
-			this.#pane = "main";
-			this.#refreshRoleRows();
-			void this.#refreshAgents();
+			this.#moveDetail(ev.wheel);
 			return;
 		}
 		if (!ev.leftClick) return;
